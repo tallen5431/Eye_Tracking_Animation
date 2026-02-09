@@ -91,6 +91,13 @@ class PupilTrackerTuner:
         # Iris ellipse smoothing (reduces jitter)
         self._iris_ellipse_smoothed = None
 
+        # Pupil ellipse smoothing (reduces blob jumping)
+        self._pupil_ellipse_smoothed = None
+        self._pupil_smooth_alpha = 0.55  # higher = keep more of previous (0.0-1.0)
+
+        # Previous pupil center for scoring bias (passed to detect_pupil_blob)
+        self._prev_pupil_center = None
+
     # ---------------------- window layout helpers ----------------------
 
     def _grid_positions(self, start_x=30, start_y=30, cell_w=360, cell_h=260, cols=4, pad=10):
@@ -105,18 +112,13 @@ class PupilTrackerTuner:
     
     def _show_in_grid(self, items, start_x=30, start_y=30, cell_w=360, cell_h=260, cols=4, pad=10):
         """
-        Render all pipeline steps into a SINGLE composite window so the OS doesn't stack
-        windows on top of each other.
-
-        items: list of (title, img_or_None)
-        - img can be BGR (preferred) or gray; None is skipped.
+        Render all pipeline steps into a SINGLE composite window.
+        Reuses canvas buffer across frames to avoid allocation overhead.
         """
-        # Filter to only images we actually want to show
         vis_items = [(t, im) for (t, im) in items if im is not None]
         if not vis_items:
             return
 
-        # Ensure the composite window exists (resizable) and only move/resize once
         win = getattr(self, "PIPELINE_WINDOW_NAME", "Pupil Tuner - Pipeline")
         if not getattr(self, "_pipeline_window_ready", False):
             try:
@@ -124,7 +126,6 @@ class PupilTrackerTuner:
             except Exception:
                 pass
             self._pipeline_window_ready = True
-            # Place it once; subsequent frames just update the pixels
             try:
                 cv2.moveWindow(win, int(start_x), int(start_y))
             except Exception:
@@ -134,19 +135,23 @@ class PupilTrackerTuner:
         cols = max(1, int(min(cols, n)))
         rows = int(math.ceil(n / cols))
 
-        # Canvas size
         canvas_w = pad + cols * (cell_w + pad)
         canvas_h = pad + rows * (cell_h + pad)
-        canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
 
-        # Draw each tile
+        # Reuse canvas buffer if dimensions match, otherwise allocate
+        canvas = getattr(self, "_grid_canvas", None)
+        if canvas is None or canvas.shape[0] != canvas_h or canvas.shape[1] != canvas_w:
+            canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+            self._grid_canvas = canvas
+        else:
+            canvas[:] = 0
+
         for idx, (title, img) in enumerate(vis_items):
             r = idx // cols
             c = idx % cols
             x0 = pad + c * (cell_w + pad)
             y0 = pad + r * (cell_h + pad)
 
-            # Normalize to BGR uint8
             tile = img
             if tile is None:
                 continue
@@ -157,7 +162,6 @@ class PupilTrackerTuner:
             if tile.dtype != np.uint8:
                 tile = np.clip(tile, 0, 255).astype(np.uint8)
 
-            # Fit into cell while preserving aspect ratio
             h, w = tile.shape[:2]
             if h <= 0 or w <= 0:
                 continue
@@ -166,25 +170,14 @@ class PupilTrackerTuner:
             nh = max(1, int(h * scale))
             tile_rs = cv2.resize(tile, (nw, nh), interpolation=cv2.INTER_AREA)
 
-            # Center in the cell
             x1 = x0 + (cell_w - nw) // 2
             y1 = y0 + (cell_h - nh) // 2
             canvas[y1:y1 + nh, x1:x1 + nw] = tile_rs
 
-            # Cell outline + title text (inside the composite image)
             cv2.rectangle(canvas, (x0, y0), (x0 + cell_w, y0 + cell_h), (60, 60, 60), 1)
-            cv2.putText(
-                canvas,
-                str(title),
-                (x0 + 6, y0 + 18),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (255, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
+            cv2.putText(canvas, str(title), (x0 + 6, y0 + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
-        # Show the composite
         cv2.imshow(win, canvas)
         try:
             cv2.resizeWindow(win, int(canvas_w), int(canvas_h))
@@ -199,25 +192,28 @@ class PupilTrackerTuner:
 
     def _preview_with_ellipse(self, img, ellipse, color=(0, 255, 255), thickness=2):
         """
-        Return a copy of img with ellipse drawn on top (for preview windows).
-        If img is grayscale, converts to BGR so the overlay is visible.
+        Return img with ellipse drawn on top (for preview windows).
+        Avoids copy when no ellipse needs to be drawn.
         """
         if img is None:
             return None
 
-        # Convert gray -> BGR so overlay color shows up
+        if not self.preview_show_ellipse or ellipse is None:
+            # No overlay needed — return as-is (grid will handle gray→BGR)
+            return img
+
+        # Need to draw on it, so convert and copy
         if img.ndim == 2:
             out = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         else:
             out = img.copy()
 
-        if self.preview_show_ellipse and ellipse is not None:
-            try:
-                cv2.ellipse(out, ellipse, color, thickness)
-                (cx, cy), _, _ = ellipse
-                cv2.circle(out, (int(cx), int(cy)), 3, color, -1)
-            except Exception:
-                pass
+        try:
+            cv2.ellipse(out, ellipse, color, thickness)
+            (cx, cy), _, _ = ellipse
+            cv2.circle(out, (int(cx), int(cy)), 3, color, -1)
+        except Exception:
+            pass
 
         return out
 
@@ -577,29 +573,40 @@ class PupilTrackerTuner:
                 )
             self.img_iris_roi_mask = iris_roi_mask
 
-            pupil_ellipse, pupil_conf, pupil_blob, raw_mask, _info = detect_pupil_blob(roi_bgr, self.params, iris_roi_mask_u8=iris_roi_mask)
+            pupil_ellipse, pupil_conf, pupil_blob, raw_mask, _info = detect_pupil_blob(
+                roi_bgr, self.params,
+                iris_roi_mask_u8=iris_roi_mask,
+                prev_center=self._prev_pupil_center,
+            )
 
-            # Debug views: keep the existing window meanings:
-            #   Stage 4 ("Threshold")   -> raw_mask
-            #   Stage 5 ("Morphology")  -> final filled blob
+            # Smooth the pupil ellipse to reduce frame-to-frame jumping
+            if pupil_ellipse is not None:
+                self._pupil_ellipse_smoothed = self._smooth_ellipse(
+                    self._pupil_ellipse_smoothed, pupil_ellipse,
+                    alpha=self._pupil_smooth_alpha,
+                )
+                pupil_ellipse = self._pupil_ellipse_smoothed
+                self._prev_pupil_center = (pupil_ellipse[0][0], pupil_ellipse[0][1])
+
+            # Debug views
             self.img_threshold = raw_mask
             self.img_morphology = pupil_blob
 
-            # Use the detected ellipse for downstream (sharing + iris anchor)
             bin_img = (pupil_blob if (pupil_blob is not None and np.count_nonzero(pupil_blob) > 0) else (raw_mask if raw_mask is not None else self._binary_for_pupil(self.img_preprocessed)))
             min_area = int(self.params.min_area)
             max_area = int(self.params.max_area)
 
-        # Prefer external contours to avoid selecting hole contours
-        ext_contours = find_external_contours(bin_img)
-
         if self.detect_mode != "iris":
-            # Blob mode: use the filled blob (already cleaned in detect_pupil_blob) as the truth.
-            # This avoids unstable scoring against eyelids / lashes / glasses rims.
-            best_contour = max(ext_contours, key=cv2.contourArea) if ext_contours else None
+            # Blob mode: use the smoothed pupil ellipse directly.
+            # Skip redundant contour finding — detect_pupil_blob already did it.
+            best_contour = None
             best_score = float(pupil_conf or 0.0)
             metas = []
-            ellipse = pupil_ellipse if pupil_ellipse is not None else fit_ellipse_if_possible(best_contour)
+            ellipse = pupil_ellipse
+            if ellipse is None and bin_img is not None:
+                ext_contours = find_external_contours(bin_img)
+                best_contour = max(ext_contours, key=cv2.contourArea) if ext_contours else None
+                ellipse = fit_ellipse_if_possible(best_contour)
 
         else:
             # Iris mode: contour -> center-pick -> fallback scorer

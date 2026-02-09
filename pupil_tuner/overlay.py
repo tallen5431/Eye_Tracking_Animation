@@ -40,7 +40,7 @@ def eye_overlay(frame_bgr: np.ndarray, ellipse, best_score: float, iris_ellipse=
     """
     overlay = frame_bgr.copy()
 
-    # Optional: visualize blob-mask pupil detection (filled)
+    # Optional: visualize blob-mask pupil detection (filled cyan tint)
     if pupil_blob is not None:
         try:
             m = pupil_blob
@@ -50,11 +50,14 @@ def eye_overlay(frame_bgr: np.ndarray, ellipse, best_score: float, iris_ellipse=
                 m = cv2.cvtColor(m, cv2.COLOR_BGR2GRAY)
             sel = (m == 255)
             if np.any(sel):
-                # BGR tint: cyan
-                tint = np.array([255, 255, 0], dtype=np.float32)
-                out_f = overlay.astype(np.float32)
-                out_f[sel] = out_f[sel] * 0.45 + tint * 0.55
-                overlay = out_f.astype(np.uint8)
+                # Integer blend on masked pixels only (avoids full-frame float32)
+                # 0.45 * pixel + 0.55 * [255,255,0] using fixed-point: *115/256 + const
+                px = overlay[sel].astype(np.uint16)
+                # cyan tint: B=255, G=255, R=0 scaled by 0.55 * 256 = 140.8 ≈ 140
+                overlay[sel] = np.clip(
+                    (px * 115 + np.array([35700, 35700, 0], dtype=np.uint16)) >> 8,
+                    0, 255
+                ).astype(np.uint8)
         except Exception:
             pass
 

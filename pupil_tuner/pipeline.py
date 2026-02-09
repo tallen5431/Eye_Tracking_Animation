@@ -581,30 +581,46 @@ def _mean_intensity_in_contour(gray_f: np.ndarray, cnt) -> float:
     cv2.drawContours(mask_roi, [shifted], -1, 255, -1)
     return float(cv2.mean(roi, mask=mask_roi)[0])
 
-def detect_pupil_blob(frame_bgr: np.ndarray, params: TuningParams, iris_roi_mask_u8: np.ndarray | None = None):
+# Temporal EMA state for dark threshold smoothing (persists across frames)
+_blob_thr_ema: float | None = None
+_BLOB_THR_EMA_ALPHA = 0.3  # blend factor for threshold EMA (lower = smoother)
+
+def detect_pupil_blob(frame_bgr: np.ndarray, params: TuningParams, iris_roi_mask_u8: np.ndarray | None = None, prev_center: tuple | None = None):
     """
     Detect pupil as the darkest *circular* region.
 
+    Args:
+        frame_bgr: BGR eye image
+        params: Tuning parameters
+        iris_roi_mask_u8: Optional iris ROI mask to constrain search
+        prev_center: Optional (x, y) from previous frame for continuity bias
+
     Returns:
         (ellipse, confidence, blob_mask_u8, raw_mask_u8, debug_info)
-
-    Notes:
-    - raw_mask_u8 is the cleaned threshold mask (good for a "threshold" debug view)
-    - blob_mask_u8 is the final filled blob used to drive overlays/ellipse fit
     """
+    global _blob_thr_ema
+
     if frame_bgr is None or frame_bgr.size == 0:
         return None, 0.0, None, None, None
 
     H, W = frame_bgr.shape[:2]
 
-    # 1) grayscale + blur (use existing blur_kernel_size for speed)
+    # 1) grayscale + blur
     gray = to_gray(frame_bgr).astype(np.float32)
     gray_f = safe_gauss(gray, int(getattr(params, "blob_blur_kernel_size", 5)))
 
-    # 2) dark percentile threshold (robust to exposure changes)
+    # 2) dark percentile threshold with temporal smoothing
     pct = float(getattr(params, "blob_dark_percentile", 6.0))
     pct = float(np.clip(pct, 0.5, 50.0))
-    thr = float(np.percentile(gray_f, pct))
+    thr_raw = float(np.percentile(gray_f, pct))
+
+    # Smooth the threshold over time to prevent mask flickering
+    if _blob_thr_ema is None:
+        _blob_thr_ema = thr_raw
+    else:
+        _blob_thr_ema += _BLOB_THR_EMA_ALPHA * (thr_raw - _blob_thr_ema)
+    thr = _blob_thr_ema
+
     mask_dark = (gray_f <= thr).astype(np.uint8) * 255
 
     # 3) optional low-saturation filter (helps ignore dark skin shadows / glasses rims)
@@ -665,6 +681,13 @@ def detect_pupil_blob(frame_bgr: np.ndarray, params: TuningParams, iris_roi_mask
     w_dark = float(getattr(params, "blob_darkness_weight", 1.8))
     w_area = float(getattr(params, "blob_area_weight", 0.0005))
 
+    # Temporal continuity: bonus for being near previous frame's detection
+    w_continuity = 4.0
+    has_prev = prev_center is not None
+    prev_cx = prev_center[0] if has_prev else 0.0
+    prev_cy = prev_center[1] if has_prev else 0.0
+    frame_diag = float(max(W, H) + 1e-6)
+
     def score(cnt) -> tuple:
         area = float(cv2.contourArea(cnt))
         if area < min_area:
@@ -678,7 +701,7 @@ def detect_pupil_blob(frame_bgr: np.ndarray, params: TuningParams, iris_roi_mask
         if c is None:
             return -1e18, None
         cx, cy = c
-        dist = float(np.hypot(cx - center_x, cy - center_y) / (max(W, H) + 1e-6))
+        dist = float(np.hypot(cx - center_x, cy - center_y) / frame_diag)
 
         # ellipse stretch guard
         e = None
@@ -697,7 +720,6 @@ def detect_pupil_blob(frame_bgr: np.ndarray, params: TuningParams, iris_roi_mask
         ext = _contour_extent(cnt)
         thin = _contour_thinness(cnt)
 
-        # strong nonlinear circle preference
         circ_boost = circ * circ
         thin_penalty = float(np.clip((thin - 120.0) / 200.0, 0.0, 4.0))
 
@@ -710,6 +732,14 @@ def detect_pupil_blob(frame_bgr: np.ndarray, params: TuningParams, iris_roi_mask
             - (w_center * dist)
             - (w_thin * thin_penalty)
         )
+
+        # Temporal continuity bonus: reward candidates near previous detection
+        if has_prev:
+            prev_dist = float(np.hypot(cx - prev_cx, cy - prev_cy) / frame_diag)
+            # Gaussian-like falloff: close = big bonus, far = no bonus
+            continuity = float(np.exp(-prev_dist * prev_dist * 50.0))
+            s += w_continuity * continuity
+
         return float(s), {"circ": float(circ), "sol": float(sol), "ext": float(ext), "thin": float(thin), "mean_gray": float(mean_int), "dist": float(dist), "area": float(area), "dark": float(dark_term), "ellipse": e}
 
     scored = []
