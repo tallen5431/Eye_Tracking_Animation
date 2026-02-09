@@ -176,91 +176,112 @@ def info_panel(
     confidence: float,
     valid_contours: int,
     detect_mode: str = "pupil",
-    width: int = 700,
-    height: int = 280,
+    width: int = 900,
+    height: int = 460,
 ) -> np.ndarray:
     """
-    Returns a HUD image. Updated to reflect controls currently in app.py:
-      - Mode toggle: m
-      - Morph kernel size: 7/8
-      - CLAHE contrast toggle uses 'h' (shown as Hist EQ (CLAHE))
-      - Threshold controls are PUPIL-only
+    Returns a HUD panel with organised sections and clear key bindings.
+    Three columns: Detection | Image Processing | Toggles & Status.
     """
     panel = np.zeros((height, width, 3), dtype=np.uint8)
 
-    # Layout constants
-    left_x = 12
-    right_x = width // 2 + 10
-    y = 22
-    line_h = 20
+    # Layout
+    col1_x = 12
+    col2_x = width // 3 + 5
+    col3_x = 2 * width // 3 + 5
+    y_top = 22
+    line_h = 19
+    section_gap = 6
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_s = 0.43
+    font_hdr = 0.52
+    white = (210, 210, 210)
+    cyan = (0, 255, 255)
+    dim = (120, 120, 120)
+    green = (0, 220, 0)
+    red = (0, 0, 255)
 
-    # Header
-    header = f"TUNING PARAMETERS   |   MODE: {detect_mode.upper()}  (m)"
-    cv2.putText(panel, header, (left_x, y),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-    y += line_h + 10
+    def _hdr(x, y, text):
+        cv2.putText(panel, text, (x, y), font, font_hdr, cyan, 1, cv2.LINE_AA)
+        return y + line_h + 2
 
-    # Left column: numeric params + keys
-    params_lines = [
-        f"Threshold: {params.threshold_value}  ( +/- )",
-        f"Min Area: {params.min_area}  ( z / x )",
-        f"Max Area: {params.max_area}  ( c / v )",
-        f"Min Circularity: {params.min_circularity:.2f}  ( b / n )",
-        f"Blur Kernel: {params.blur_kernel_size}  ( 1 / 2 )",
-        f"Morph Close: {params.morph_close_iterations}  ( 3 / 4 )",
-        f"Morph Open: {params.morph_open_iterations}  ( 5 / 6 )",
-        f"Morph Kernel: {params.morph_kernel_size}  ( 7 / 8 )",
-        "",
-        f"[IMG] Contrast: {params.contrast_alpha:.1f}  ( 9 / 0 )",
-        f"[IMG] Brightness: {params.brightness_beta:+d}  ( , / . )",
-        f"[IMG] Gamma: {params.gamma_value:.1f}  ( / / ; )",
-        f"[IMG] Sharpen: {params.sharpen_amount:.1f}  ( [ / ] )",
-        f"[IMG] CLAHE Clip: {params.clahe_clip_limit:.1f}  ( \\ / ' )",
-        f"[GLARE] Threshold: {params.glare_threshold}  ( e / t )",
-        f"[GLARE] Radius: {params.glare_inpaint_radius}  ( y / u )",
-    ]
-    
-    # Add iris-specific params
-    params_lines.append("")
-    params_lines.append(f"[IRIS] Sclera Threshold: {params.iris_sclera_threshold}  ( i / o )")
-    params_lines.append(f"[IRIS] Blur: {params.iris_blur}  ( k / l )")
-    params_lines.append(f"[IRIS] Expand Ratio: {params.iris_expand_ratio:.1f}x  ( [ / ] )")
-    yy = y
-    for s in params_lines:
-        cv2.putText(panel, s, (left_x, yy),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (210, 210, 210), 1)
-        yy += line_h
+    def _line(x, y, text, color=white):
+        cv2.putText(panel, text, (x, y), font, font_s, color, 1, cv2.LINE_AA)
+        return y + line_h
 
-    # Right column: toggles
-    yy = y
-    options = [
-        ("Hist EQ (CLAHE)", toggles.use_histogram_eq, "h"),
+    # ------- Header -------
+    header = f"MODE: {detect_mode.upper()}  (m to toggle)     SPACE: toggle views     r: reset     q/ESC: quit"
+    cv2.putText(panel, header, (col1_x, y_top), font, 0.50, cyan, 1, cv2.LINE_AA)
+    y_start = y_top + line_h + section_gap
+
+    # ============ COLUMN 1: Detection ============
+    y = _hdr(col1_x, y_start, "DETECTION")
+    y = _line(col1_x, y, f"Threshold: {params.threshold_value}        +/-")
+    y = _line(col1_x, y, f"Min Area: {params.min_area}           z/x")
+    y = _line(col1_x, y, f"Max Area: {params.max_area}          c/v")
+    y = _line(col1_x, y, f"Min Circ: {params.min_circularity:.2f}          b/n")
+    y = _line(col1_x, y, f"Blur Kern: {params.blur_kernel_size}             1/2")
+    y += section_gap
+    y = _hdr(col1_x, y, "MORPHOLOGY")
+    y = _line(col1_x, y, f"Close Iter: {params.morph_close_iterations}            3/4")
+    y = _line(col1_x, y, f"Open Iter: {params.morph_open_iterations}             5/6")
+    y = _line(col1_x, y, f"Kernel: {params.morph_kernel_size}                7/8")
+    y += section_gap
+    y = _hdr(col1_x, y, "IRIS")
+    y = _line(col1_x, y, f"Sclera Thr: {params.iris_sclera_threshold}         i/o")
+    y = _line(col1_x, y, f"Blur: {params.iris_blur}                  k/l")
+    y = _line(col1_x, y, f"Expand: {params.iris_expand_ratio:.1f}x            [/]")
+
+    # ============ COLUMN 2: Image Processing ============
+    y = _hdr(col2_x, y_start, "IMAGE PROCESSING")
+    y = _line(col2_x, y, f"Contrast: {params.contrast_alpha:.1f}           9/0")
+    y = _line(col2_x, y, f"Brightness: {params.brightness_beta:+d}          ,/.")
+    y = _line(col2_x, y, f"Gamma: {params.gamma_value:.1f}              ;/ /")
+    y = _line(col2_x, y, f"CLAHE Clip: {params.clahe_clip_limit:.1f}          \\/'" )
+    y += section_gap
+    y = _hdr(col2_x, y, "GLARE REMOVAL")
+    y = _line(col2_x, y, f"Glare Thr: {params.glare_threshold}           e/t")
+    y = _line(col2_x, y, f"Inpaint Rad: {params.glare_inpaint_radius}           y/u")
+    y += section_gap
+    y = _hdr(col2_x, y, "BLOB PARAMS")
+    y = _line(col2_x, y, f"Dark %ile: {params.blob_dark_percentile:.0f}")
+    y = _line(col2_x, y, f"Close K: {params.blob_close_ksize}")
+    y = _line(col2_x, y, f"Min Circ: {params.blob_min_circularity:.2f}")
+    y = _line(col2_x, y, f"Sat Max: {params.blob_sat_max}")
+    y = _line(col2_x, y, f"ROI Dilate: {params.blob_iris_roi_dilate_k}")
+
+    # ============ COLUMN 3: Toggles & Status ============
+    y = _hdr(col3_x, y_start, "TOGGLES")
+    toggles_list = [
+        ("CLAHE (Hist EQ)", toggles.use_histogram_eq, "h"),
         ("Glint Removal", toggles.use_glint_removal, "g"),
         ("Glasses Mode", toggles.use_glasses_mode, "w"),
-        ("Auto Thresh (Otsu)", toggles.use_auto_threshold, "a"),
+        ("Auto Thresh", toggles.use_auto_threshold, "a"),
         ("Adaptive Thresh", toggles.use_adaptive_threshold, "d"),
         ("Bilateral Filter", toggles.use_bilateral_filter, "f"),
     ]
-    for name, state, key in options:
-        color = (0, 255, 0) if state else (100, 100, 100)
-        cv2.putText(panel, f"{name}: {'ON' if state else 'OFF'}  ({key})",
-                    (right_x, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-        yy += line_h
+    for name, state, key in toggles_list:
+        color = green if state else dim
+        label = "ON" if state else "OFF"
+        y = _line(col3_x, y, f"{label:>3}  {name}  ({key})", color)
 
-    yy += 8
-    # Status box
-    cv2.putText(panel, f"FPS: {fps:.1f}", (right_x, yy),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
-    yy += line_h
+    y += section_gap + 4
+    y = _hdr(col3_x, y, "STATUS")
+
+    fps_color = green if fps >= 20 else (0, 165, 255) if fps >= 10 else red
+    y = _line(col3_x, y, f"FPS: {fps:.1f}", fps_color)
 
     if has_detection:
-        cv2.putText(panel, f"Confidence: {confidence*100:.0f}%",
-                    (right_x, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
-        yy += line_h
-        cv2.putText(panel, f"Valid Contours: {valid_contours}",
-                    (right_x, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+        conf_pct = confidence * 100
+        if conf_pct >= 70:
+            conf_color = green
+        elif conf_pct >= 40:
+            conf_color = (0, 165, 255)
+        else:
+            conf_color = red
+        y = _line(col3_x, y, f"Confidence: {conf_pct:.0f}%", conf_color)
+        y = _line(col3_x, y, f"Contours: {valid_contours}", white)
     else:
-        cv2.putText(panel, "NO DETECTION",
-                    (right_x, yy), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 255), 2)
+        y = _line(col3_x, y, "NO DETECTION", red)
 
     return panel

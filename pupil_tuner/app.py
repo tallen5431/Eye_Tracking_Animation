@@ -82,8 +82,8 @@ class PupilTrackerTuner:
         self.GRID_PAD = 10
 
         # Info panel window sizing (keep it large & readable)
-        self.PANEL_W = 900  # Increased from 700
-        self.PANEL_H = 320  # Increased from 280
+        self.PANEL_W = 900
+        self.PANEL_H = 460
 
         # Whether to draw ellipse on preview windows
         self.preview_show_ellipse = True
@@ -97,6 +97,12 @@ class PupilTrackerTuner:
 
         # Previous pupil center for scoring bias (passed to detect_pupil_blob)
         self._prev_pupil_center = None
+
+        # Detection hold: keep previous ellipse for N frames when detection drops
+        self._detection_hold_frames = 0
+        self._DETECTION_HOLD_MAX = 8  # hold last good detection for up to 8 frames
+        self._held_ellipse = None
+        self._held_confidence = 0.0
 
     # ---------------------- window layout helpers ----------------------
 
@@ -113,10 +119,11 @@ class PupilTrackerTuner:
     def _show_in_grid(self, items, start_x=30, start_y=30, cell_w=360, cell_h=260, cols=4, pad=10):
         """
         Render all pipeline steps into a SINGLE composite window.
+        Always renders every slot (with placeholder if image is None) to
+        prevent window resizing / flickering when detection drops.
         Reuses canvas buffer across frames to avoid allocation overhead.
         """
-        vis_items = [(t, im) for (t, im) in items if im is not None]
-        if not vis_items:
+        if not items:
             return
 
         win = getattr(self, "PIPELINE_WINDOW_NAME", "Pupil Tuner - Pipeline")
@@ -131,7 +138,7 @@ class PupilTrackerTuner:
             except Exception:
                 pass
 
-        n = len(vis_items)
+        n = len(items)
         cols = max(1, int(min(cols, n)))
         rows = int(math.ceil(n / cols))
 
@@ -146,15 +153,24 @@ class PupilTrackerTuner:
         else:
             canvas[:] = 0
 
-        for idx, (title, img) in enumerate(vis_items):
+        for idx, (title, img) in enumerate(items):
             r = idx // cols
             c = idx % cols
             x0 = pad + c * (cell_w + pad)
             y0 = pad + r * (cell_h + pad)
 
-            tile = img
-            if tile is None:
+            # Always draw cell border and title so empty slots are visible
+            cv2.rectangle(canvas, (x0, y0), (x0 + cell_w, y0 + cell_h), (60, 60, 60), 1)
+            cv2.putText(canvas, str(title), (x0 + 6, y0 + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+
+            if img is None:
+                # Dark placeholder with "no data" indicator
+                cv2.putText(canvas, "---", (x0 + cell_w // 2 - 15, y0 + cell_h // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (50, 50, 50), 1, cv2.LINE_AA)
                 continue
+
+            tile = img
             if tile.ndim == 2:
                 tile = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGR)
             elif tile.shape[2] == 4:
@@ -174,10 +190,6 @@ class PupilTrackerTuner:
             y1 = y0 + (cell_h - nh) // 2
             canvas[y1:y1 + nh, x1:x1 + nw] = tile_rs
 
-            cv2.rectangle(canvas, (x0, y0), (x0 + cell_w, y0 + cell_h), (60, 60, 60), 1)
-            cv2.putText(canvas, str(title), (x0 + 6, y0 + 18),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
-
         cv2.imshow(win, canvas)
         try:
             cv2.resizeWindow(win, int(canvas_w), int(canvas_h))
@@ -185,8 +197,16 @@ class PupilTrackerTuner:
             pass
 
     def _show_info_panel(self, title: str, panel_img: np.ndarray):
-        """Deprecated: the info panel is now shown inside the composite pipeline grid."""
-        return
+        """Show info panel in a dedicated persistent window that never hides."""
+        win = "Pupil Tuner - Controls"
+        if not getattr(self, "_info_window_ready", False):
+            try:
+                cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+            except Exception:
+                pass
+            self._info_window_ready = True
+        if panel_img is not None:
+            cv2.imshow(win, panel_img)
 
     # ---------------------- preview overlay helper ----------------------
 
@@ -302,10 +322,11 @@ class PupilTrackerTuner:
 
             cx = M["m10"] / M["m00"]
             cy = M["m01"] / M["m00"]
-            d = np.sqrt((cx - cx0) ** 2 + (cy - cy0) ** 2)
-            
+            d_sq = (cx - cx0) ** 2 + (cy - cy0) ** 2
+            half_min = min(w, h) * 0.5
+
             # Score: closer to center AND more circular = better
-            center_score = 1.0 - (d / (min(w, h) * 0.5))
+            center_score = 1.0 - (d_sq ** 0.5 / half_min) if half_min > 0 else 0.0
             score = center_score * 0.6 + circularity * 0.4
 
             if score > best_score:
@@ -633,6 +654,18 @@ class PupilTrackerTuner:
 
             ellipse = fit_ellipse_if_possible(best_contour)
 
+        # Detection hold: if ellipse is lost, reuse previous for a few frames
+        if ellipse is not None:
+            self._held_ellipse = ellipse
+            self._held_confidence = float(best_score)
+            self._detection_hold_frames = 0
+        else:
+            self._detection_hold_frames += 1
+            if self._detection_hold_frames <= self._DETECTION_HOLD_MAX and self._held_ellipse is not None:
+                ellipse = self._held_ellipse
+                # Decay confidence while holding so shared tracker knows it's stale
+                best_score = self._held_confidence * max(0.0, 1.0 - self._detection_hold_frames * 0.12)
+
         # Compute iris ellipse AFTER we have pupil ellipse
         self.iris_ellipse = self._fit_iris_ellipse_simple(self.img_preprocessed, ellipse)
 
@@ -837,12 +870,6 @@ class PupilTrackerTuner:
                 elif key == ord(';'):
                     self.params.gamma_value = min(2.0, self.params.gamma_value + 0.1)
                     print(f"[IMG] Gamma: {self.params.gamma_value:.1f}")
-                elif key == ord('['):
-                    self.params.sharpen_amount = max(0.0, self.params.sharpen_amount - 0.2)
-                    print(f"[IMG] Sharpen: {self.params.sharpen_amount:.1f}")
-                elif key == ord(']'):
-                    self.params.sharpen_amount = min(2.0, self.params.sharpen_amount + 0.2)
-                    print(f"[IMG] Sharpen: {self.params.sharpen_amount:.1f}")
                 elif key == ord('\\'):
                     self.params.clahe_clip_limit = max(1.0, self.params.clahe_clip_limit - 0.5)
                     print(f"[IMG] CLAHE Clip: {self.params.clahe_clip_limit:.1f}")

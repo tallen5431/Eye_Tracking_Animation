@@ -803,16 +803,18 @@ class EyeAnimation:
         confidence = 0.0
         if self.tracker:
             track_x, track_y, confidence = self.tracker.get_position()
-            if confidence > 0.3:
+            if confidence > 0.2:
                 self.target_dx = track_x * self.MAX_X * TRACK_SENSITIVITY_X
                 self.target_dy = track_y * self.MAX_Y * TRACK_SENSITIVITY_Y
+            # When confidence is very low (< 0.2), don't update target — hold position
         elif self.demo_mode:
             self.target_dx, self.target_dy = self._get_demo_position()
             confidence = 1.0
 
-        # Adaptive smoothing: more smoothing (lower alpha) when confidence is low
-        # This reduces jitter from noisy/uncertain detections
-        alpha = SMOOTHING * (0.5 + 0.5 * min(1.0, confidence + 0.3))
+        # Adaptive smoothing: aggressive smoothing when confidence is low
+        # conf >= 0.7: full responsiveness; conf ~0.3: moderate; conf ~0: barely moves
+        conf_factor = max(0.15, min(1.0, confidence * 1.2))
+        alpha = SMOOTHING * conf_factor
         self.current_dx += (self.target_dx - self.current_dx) * alpha
         self.current_dy += (self.target_dy - self.current_dy) * alpha
 
