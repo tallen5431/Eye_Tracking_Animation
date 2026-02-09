@@ -610,6 +610,7 @@ class PupilTrackerTuner:
 
         else:
             # Iris mode: contour -> center-pick -> fallback scorer
+            ext_contours = find_external_contours(bin_img)
             best_contour = self._pick_contour_near_center(
                 ext_contours,
                 shape_hw=roi_bgr.shape[:2],

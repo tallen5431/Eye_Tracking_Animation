@@ -407,6 +407,9 @@ class EyeTracker:
         self.cal_x = 0.0
         self.cal_y = 0.0
 
+        # Stay centered until first calibration completes
+        self._calibrated = False
+
     def start(self) -> bool:
         """Start tracker thread (Windows/Linux).
 
@@ -462,6 +465,7 @@ class EyeTracker:
     def calibrate(self, duration=2.0, callback=None):
         """Request tracker recalibration (center gaze)."""
         self.recalibrate_requested = True
+        self._calibrated = True
         # If tracker supports explicit recalibration, call it too.
         try:
             if self.tracker is not None and hasattr(self.tracker, 'recalibrate'):
@@ -491,7 +495,9 @@ class EyeTracker:
             time.sleep(0.016)  # ~60Hz
 
     def get_position(self):
-        """Get current calibrated position."""
+        """Get current calibrated position. Returns zeros until first calibration."""
+        if not self._calibrated:
+            return (0.0, 0.0, 0.0)
         with self.lock:
             return (
                 self.offset_x - self.cal_x,

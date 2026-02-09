@@ -284,8 +284,8 @@ def create_iris_mask_from_sclera(gray: np.ndarray, params: TuningParams, pupil_c
     # Invert: dark regions (iris + pupil) become white
     iris_region = cv2.bitwise_not(sclera_mask)
     
-    # Clean up with morphology
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    # Clean up with morphology (cached structuring element)
+    kernel = _get_ellipse_se(5)
     iris_region = cv2.morphologyEx(iris_region, cv2.MORPH_CLOSE, kernel, iterations=2)
     iris_region = cv2.morphologyEx(iris_region, cv2.MORPH_OPEN, kernel, iterations=1)
     
@@ -404,7 +404,7 @@ def threshold(img_blurred: np.ndarray, params: TuningParams, toggles: TuningTogg
 
 def morphology(bin_img: np.ndarray, params: TuningParams) -> tuple[np.ndarray, np.ndarray]:
     k = _odd(params.morph_kernel_size, minimum=1)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    kernel = _get_ellipse_se(k)
 
     out = bin_img.copy()
     if params.morph_close_iterations > 0:
@@ -454,10 +454,10 @@ def keep_largest_cc(mask_u8: np.ndarray, min_area_frac: float = 0.0) -> np.ndarr
     out = np.zeros_like(mask_u8)
     out[labels == best_idx] = 255
 
-    # Optional guard: if the "largest" is still too small, return original mask
+    # Optional guard: if the largest CC is too small relative to total mask area, keep original
     if min_area_frac and min_area_frac > 0.0:
-        # (Since we're keeping only largest, this is mostly defensive)
-        if best_area < (best_area * float(min_area_frac)):
+        total_area = float(np.count_nonzero(mask_u8))
+        if total_area > 0 and best_area < (total_area * float(min_area_frac)):
             return mask_u8
     return out
 
@@ -610,9 +610,10 @@ def detect_pupil_blob(frame_bgr: np.ndarray, params: TuningParams, iris_roi_mask
     gray_f = safe_gauss(gray, int(getattr(params, "blob_blur_kernel_size", 5)))
 
     # 2) dark percentile threshold with temporal smoothing
-    pct = float(getattr(params, "blob_dark_percentile", 6.0))
+    #    Subsample the image for faster percentile computation (~16x fewer pixels)
+    pct = float(getattr(params, "blob_dark_percentile", 8.0))
     pct = float(np.clip(pct, 0.5, 50.0))
-    thr_raw = float(np.percentile(gray_f, pct))
+    thr_raw = float(np.percentile(gray_f[::4, ::4], pct))
 
     # Smooth the threshold over time to prevent mask flickering
     if _blob_thr_ema is None:
@@ -639,11 +640,9 @@ def detect_pupil_blob(frame_bgr: np.ndarray, params: TuningParams, iris_roi_mask
         dk = int(getattr(params, 'blob_iris_roi_dilate_k', 21))
         ek = int(getattr(params, 'blob_iris_roi_erode_k', 0))
         if dk >= 3:
-            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd(dk, minimum=3), _odd(dk, minimum=3)))
-            roi = cv2.dilate(roi, k, iterations=1)
+            roi = cv2.dilate(roi, _get_ellipse_se(_odd(dk, minimum=3)), iterations=1)
         if ek >= 3:
-            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd(ek, minimum=3), _odd(ek, minimum=3)))
-            roi = cv2.erode(roi, k, iterations=1)
+            roi = cv2.erode(roi, _get_ellipse_se(_odd(ek, minimum=3)), iterations=1)
         raw = cv2.bitwise_and(raw, roi)
 
     # Choose a center reference for scoring (prefer blobs near iris ROI center if provided).
