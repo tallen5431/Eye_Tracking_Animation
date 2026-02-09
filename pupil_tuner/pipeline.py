@@ -37,6 +37,18 @@ def _odd(k: int, minimum: int = 0) -> int:
     return k if (k % 2 == 1) else k + 1
 
 
+_se_cache: dict[tuple[int, int], np.ndarray] = {}
+
+def _get_ellipse_se(k: int) -> np.ndarray:
+    """Get (and cache) an elliptical structuring element of size k x k."""
+    key = (k, k)
+    se = _se_cache.get(key)
+    if se is None:
+        se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, key)
+        _se_cache[key] = se
+    return se
+
+
 def ellipse_roi_mask_u8(shape_hw, ellipse, scale=1.25, dilate_k=0, erode_k=0):
     """Create a filled elliptical ROI mask (0/255) from a cv2.fitEllipse-style tuple.
 
@@ -102,23 +114,21 @@ def adjust_contrast_brightness(img: np.ndarray, alpha: float = 1.0, beta: int = 
     return adjusted
 
 
+_gamma_lut_cache: dict[float, np.ndarray] = {}
+
 def adjust_gamma(img: np.ndarray, gamma: float = 1.0) -> np.ndarray:
     """
-    Apply gamma correction.
-    
-    Args:
-        img: Input image (grayscale)
-        gamma: Gamma value (1.0 = no change, <1.0 = darker, >1.0 = brighter)
-    
-    Returns:
-        Gamma-corrected image
+    Apply gamma correction with cached LUT for repeated gamma values.
     """
     if gamma == 1.0:
         return img
-    
-    # Build lookup table
-    inv_gamma = 1.0 / float(gamma)
-    table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)], dtype=np.uint8)
+
+    # Cache the LUT so we don't rebuild it every frame
+    table = _gamma_lut_cache.get(gamma)
+    if table is None:
+        inv_gamma = 1.0 / float(gamma)
+        table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)], dtype=np.uint8)
+        _gamma_lut_cache[gamma] = table
     return cv2.LUT(img, table)
 
 
@@ -142,20 +152,19 @@ def sharpen_image(img: np.ndarray, amount: float = 0.0) -> np.ndarray:
     return sharpened
 
 
+_clahe_cache: dict[tuple[float, int], cv2.CLAHE] = {}
+
 def apply_clahe(img_u8: np.ndarray, clip_limit: float = 2.0, tile_grid_size: int = 8) -> np.ndarray:
     """
     Local-contrast enhancer (usually better than equalizeHist for eye imagery).
-    
-    Args:
-        img_u8: Input image (grayscale uint8)
-        clip_limit: CLAHE clip limit (1.0-8.0, higher = more aggressive)
-        tile_grid_size: Grid size for local regions (4-16, smaller = more local)
-    
-    Returns:
-        CLAHE-enhanced image
+    Caches the CLAHE object to avoid recreation every frame.
     """
     grid = max(4, min(16, int(tile_grid_size)))
-    clahe = cv2.createCLAHE(clipLimit=float(clip_limit), tileGridSize=(grid, grid))
+    key = (float(clip_limit), grid)
+    clahe = _clahe_cache.get(key)
+    if clahe is None:
+        clahe = cv2.createCLAHE(clipLimit=float(clip_limit), tileGridSize=(grid, grid))
+        _clahe_cache[key] = clahe
     return clahe.apply(img_u8)
 
 
@@ -174,9 +183,8 @@ def auto_canny_u8(img_u8: np.ndarray, sigma: float = 0.33) -> np.ndarray:
 
 def preprocess(gray: np.ndarray, params: TuningParams, toggles: TuningToggles) -> tuple[np.ndarray, dict]:
     """
-    ENHANCED: Step-by-step preprocessing with adjustable parameters at each stage.
-    UPDATED: Improved glare removal for glasses users.
-    
+    Step-by-step preprocessing with adjustable parameters at each stage.
+
     Pipeline:
       1. Contrast/brightness adjustment
       2. Gamma correction
@@ -184,63 +192,60 @@ def preprocess(gray: np.ndarray, params: TuningParams, toggles: TuningToggles) -
       4. Bilateral filter (optional)
       5. CLAHE (optional)
       6. Glint/glare removal (optional, enhanced for glasses)
-    
+
     Returns:
         (processed_image, debug_images_dict)
     """
     debug = {}
+    # Each processing step returns a new array so we don't need explicit copies
+    # except for the original which we snapshot once.
     img = gray.copy()
-    debug['0_original'] = img.copy()
-    
+    debug['0_original'] = gray  # read-only reference; gray is not mutated
+
     # Step 1: Contrast & Brightness
     if params.contrast_alpha != 1.0 or params.brightness_beta != 0:
         img = adjust_contrast_brightness(img, params.contrast_alpha, params.brightness_beta)
-    debug['1_contrast_brightness'] = img.copy()
-    
+    debug['1_contrast_brightness'] = img
+
     # Step 2: Gamma Correction
     if params.gamma_value != 1.0:
         img = adjust_gamma(img, params.gamma_value)
-    debug['2_gamma'] = img.copy()
-    
+    debug['2_gamma'] = img
+
     # Step 3: Sharpening
     if params.sharpen_amount > 0.0:
         img = sharpen_image(img, params.sharpen_amount)
-    debug['3_sharpened'] = img.copy()
-    
+    debug['3_sharpened'] = img
+
     # Step 4: Bilateral Filter (noise reduction, edge-preserving)
     if toggles.use_bilateral_filter:
         img = cv2.bilateralFilter(img, 5, 50, 50)
-    debug['4_bilateral'] = img.copy()
-    
+    debug['4_bilateral'] = img
+
     # Step 5: CLAHE (local contrast enhancement)
     if toggles.use_histogram_eq:
         img = apply_clahe(img, params.clahe_clip_limit, params.clahe_grid_size)
-    debug['5_clahe'] = img.copy()
-    
+    debug['5_clahe'] = img
+
     # Step 6: Enhanced Glint/Glare Removal
     if toggles.use_glint_removal:
         thresh = max(200, min(250, int(params.glare_threshold)))
         radius = max(3, min(10, int(params.glare_inpaint_radius)))
-        
-        # Detect glare (bright spots)
+
         _, glare_mask = cv2.threshold(img, thresh, 255, cv2.THRESH_BINARY)
-        
-        # Glasses mode: more aggressive removal
+
         if toggles.use_glasses_mode:
-            # Larger dilation to cover glare halos
             kernel = np.ones((7, 7), np.uint8)
             glare_mask = cv2.dilate(glare_mask, kernel, iterations=2)
         else:
-            # Standard dilation
             kernel = np.ones((3, 3), np.uint8)
             glare_mask = cv2.dilate(glare_mask, kernel, iterations=1)
-        
-        # Inpaint if significant glare detected
+
         if cv2.countNonZero(glare_mask) > 10:
             img = cv2.inpaint(img, glare_mask, radius, cv2.INPAINT_TELEA)
-    
-    debug['6_glint_removed'] = img.copy()
-    
+
+    debug['6_glint_removed'] = img
+
     return img, debug
 
 
@@ -482,21 +487,16 @@ def clean_blob_mask(blob_u8: np.ndarray, params) -> np.ndarray:
         blob = fill_holes_u8(blob)
 
     if open_k >= 3:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k, open_k))
-        blob = cv2.morphologyEx(blob, cv2.MORPH_OPEN, k, iterations=1)
+        blob = cv2.morphologyEx(blob, cv2.MORPH_OPEN, _get_ellipse_se(open_k), iterations=1)
 
     if close_k >= 3:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
-        blob = cv2.morphologyEx(blob, cv2.MORPH_CLOSE, k, iterations=1)
-    blob = clean_blob_mask(blob, params)
+        blob = cv2.morphologyEx(blob, cv2.MORPH_CLOSE, _get_ellipse_se(close_k), iterations=1)
 
     if erode_k >= 3:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_k, erode_k))
-        blob = cv2.erode(blob, k, iterations=1)
+        blob = cv2.erode(blob, _get_ellipse_se(erode_k), iterations=1)
 
     if dilate_k >= 3:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_k, dilate_k))
-        blob = cv2.dilate(blob, k, iterations=1)
+        blob = cv2.dilate(blob, _get_ellipse_se(dilate_k), iterations=1)
 
     if keep_largest:
         blob = keep_largest_cc(blob, min_area_frac=0.0)
@@ -570,10 +570,16 @@ def _contour_centroid(cnt):
     return (float(M["m10"] / M["m00"]), float(M["m01"] / M["m00"]))
 
 def _mean_intensity_in_contour(gray_f: np.ndarray, cnt) -> float:
-    # lower mean => darker. Uses cv2.mean with a contour mask.
-    mask = np.zeros(gray_f.shape[:2], dtype=np.uint8)
-    cv2.drawContours(mask, [cnt], -1, 255, -1)
-    return float(cv2.mean(gray_f, mask=mask)[0])
+    """Mean intensity inside contour. Uses bounding-rect crop for speed."""
+    x, y, w, h = cv2.boundingRect(cnt)
+    if w <= 0 or h <= 0:
+        return 255.0
+    # Work on a small ROI instead of full image
+    roi = gray_f[y:y+h, x:x+w]
+    mask_roi = np.zeros((h, w), dtype=np.uint8)
+    shifted = cnt - np.array([x, y])
+    cv2.drawContours(mask_roi, [shifted], -1, 255, -1)
+    return float(cv2.mean(roi, mask=mask_roi)[0])
 
 def detect_pupil_blob(frame_bgr: np.ndarray, params: TuningParams, iris_roi_mask_u8: np.ndarray | None = None):
     """
@@ -632,13 +638,13 @@ def detect_pupil_blob(frame_bgr: np.ndarray, params: TuningParams, iris_roi_mask
             center_x = float(mm['m10'] / mm['m00'])
             center_y = float(mm['m01'] / mm['m00'])
 
-    # 4) morphology cleanup
+    # 4) morphology cleanup (using cached structuring elements)
     open_k = int(getattr(params, "blob_open_ksize", 5))
     close_k = int(getattr(params, "blob_close_ksize", 21))
     if open_k >= 3:
-        raw = cv2.morphologyEx(raw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd(open_k, 3), _odd(open_k, 3))), iterations=1)
+        raw = cv2.morphologyEx(raw, cv2.MORPH_OPEN, _get_ellipse_se(_odd(open_k, 3)), iterations=1)
     if close_k >= 3:
-        raw = cv2.morphologyEx(raw, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd(close_k, 3), _odd(close_k, 3))), iterations=2)
+        raw = cv2.morphologyEx(raw, cv2.MORPH_CLOSE, _get_ellipse_se(_odd(close_k, 3)), iterations=2)
 
     # 5) score candidate contours
     cnts = find_external_contours(raw)
@@ -733,7 +739,16 @@ def detect_pupil_blob(frame_bgr: np.ndarray, params: TuningParams, iris_roi_mask
         cv2.ellipse(blob, e2, 255, -1)
         e = e2
 
-    blob = cv2.morphologyEx(blob, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)), iterations=1)
+    # Close gaps then fill any internal holes (specular reflections, etc.)
+    blob = cv2.morphologyEx(blob, cv2.MORPH_CLOSE, _get_ellipse_se(15), iterations=2)
+    blob = fill_holes_u8(blob)
+
+    # Flood fill from blob centroid to capture the full connected region
+    if e is not None:
+        seed = (int(np.clip(e[0][0], 1, W - 2)), int(np.clip(e[0][1], 1, H - 2)))
+        if blob[seed[1], seed[0]] == 255:
+            ff_mask = np.zeros((H + 2, W + 2), np.uint8)
+            cv2.floodFill(blob, ff_mask, seed, 255)
 
     # 7) final ellipse: prefer fitted ellipse; fallback to minEnclosingCircle
     ellipse = None

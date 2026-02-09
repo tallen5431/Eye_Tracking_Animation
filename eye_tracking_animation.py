@@ -196,6 +196,8 @@ class SharedFileTracker:
     Supports BOTH formats:
       1) Old: {"ts":..., "cx":..., "cy":..., "frame_w":..., "frame_h":..., "confidence":...}
       2) New: {"ts":..., "frame_w":..., "frame_h":..., "confidence":..., "ellipse": {"cx":..., "cy":..., ...}}
+
+    Includes temporal smoothing and outlier rejection for stable animation.
     """
     def __init__(self, path: str):
         self.path = path
@@ -203,13 +205,34 @@ class SharedFileTracker:
         self._last = None
         self._center = None  # (cx, cy)
         self._frame = None   # (w, h)
+        # Temporal smoothing state (exponential moving average on raw pixel coords)
+        self._smooth_cx = None
+        self._smooth_cy = None
+        self._ema_alpha = 0.35  # blend factor: lower = smoother, higher = more responsive
+        # Outlier rejection: max jump as fraction of frame dimension per read
+        self._max_jump_frac = 0.15
+        # File stat cache to skip re-reading unchanged files
+        self._last_mtime = 0.0
+        self._last_size = 0
 
     def recalibrate(self):
         self._center = None
+        self._smooth_cx = None
+        self._smooth_cy = None
 
     def get_pupil_position(self):
         # Returns dict with keys: normalized_offset=(dx,dy), confidence=float
         try:
+            # Skip file read if it hasn't changed (stat is much cheaper than open+parse)
+            try:
+                st = os.stat(self.path)
+                if st.st_mtime_ns == self._last_mtime and st.st_size == self._last_size:
+                    return self._last
+                self._last_mtime = st.st_mtime_ns
+                self._last_size = st.st_size
+            except OSError:
+                return self._last
+
             with open(self.path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
 
@@ -222,18 +245,16 @@ class SharedFileTracker:
             fh = int(data.get('frame_h', 0) or 0)
             conf = float(data.get('confidence', 0.0))
 
-            # NEW: Prefer ellipse dict if present (modular tuning_tool format)
+            # Prefer ellipse dict if present (modular tuning_tool format)
             cx = cy = None
             ell = data.get('ellipse', None)
             if isinstance(ell, dict):
                 cx = ell.get('cx', None)
                 cy = ell.get('cy', None)
             else:
-                # Back-compat: older format had top-level cx/cy
                 cx = data.get('cx', None)
                 cy = data.get('cy', None)
 
-            # If missing data, do NOT wipe last (keeps animation stable)
             if cx is None or cy is None or fw <= 0 or fh <= 0:
                 return self._last
 
@@ -244,11 +265,29 @@ class SharedFileTracker:
             if self._center is None:
                 self._center = (cx, cy)
 
+            # Outlier rejection: reject sudden large jumps (likely detection errors)
+            if self._smooth_cx is not None:
+                jump_x = abs(cx - self._smooth_cx) / max(1.0, fw)
+                jump_y = abs(cy - self._smooth_cy) / max(1.0, fh)
+                if max(jump_x, jump_y) > self._max_jump_frac and conf < 0.7:
+                    # Likely a mis-detection; reduce its influence
+                    conf *= 0.3
+
+            # Temporal smoothing on raw pixel coordinates
+            if self._smooth_cx is None:
+                self._smooth_cx = cx
+                self._smooth_cy = cy
+            else:
+                # Adaptive alpha: use more smoothing when confidence is low
+                alpha = self._ema_alpha * min(1.0, conf + 0.3)
+                self._smooth_cx += alpha * (cx - self._smooth_cx)
+                self._smooth_cy += alpha * (cy - self._smooth_cy)
+
             ccx, ccy = self._center
 
-            # Normalize to -1..1 using half-frame
-            dx = (cx - ccx) / max(1.0, fw * 0.5)
-            dy = (cy - ccy) / max(1.0, fh * 0.5)
+            # Normalize smoothed coords to -1..1 using half-frame
+            dx = (self._smooth_cx - ccx) / max(1.0, fw * 0.5)
+            dy = (self._smooth_cy - ccy) / max(1.0, fh * 0.5)
             dx = max(-1.0, min(1.0, dx))
             dy = max(-1.0, min(1.0, dy))
 
@@ -261,152 +300,6 @@ class SharedFileTracker:
 
         except Exception:
             return self._last
-
-
-
-class EyeTracker:
-    """
-    Eye tracker that reads from a shared JSON file written by tuning_tool.py.
-    This allows the animation to run without opening the camera directly.
-    """
-    def __init__(self, camera_id: int = 0, share_file: str = None):
-        """
-        Initialize the eye tracker.
-        
-        Args:
-            camera_id: Camera ID (only used for logging, not opened)
-            share_file: Path to shared JSON file with pupil data
-        """
-        self.camera_id = camera_id
-        
-        # Determine share file path
-        if share_file:
-            self.share_file = share_file
-        else:
-            # Try environment variable first
-            self.share_file = os.environ.get("TRACK_SHARE_FILE")
-            
-            # Fall back to default location
-            if not self.share_file:
-                if os.name == 'nt':
-                    # Windows: use repo logs folder
-                    logs_dir = REPO_ROOT / "logs"
-                    logs_dir.mkdir(exist_ok=True)
-                    self.share_file = str(logs_dir / "pupil_share.json")
-                else:
-                    # Linux: use /tmp
-                    self.share_file = "/tmp/pupil_share.json"
-        
-        print(f"[INFO] EyeTracker using share file: {self.share_file}")
-        
-        self.tracker = None
-        self.running = False
-        self.last_position = (0.0, 0.0, 0.0)  # x, y, confidence
-        
-    def start(self) -> bool:
-        """
-        Start the eye tracker (initializes SharedFileTracker).
-        
-        Returns:
-            True if successfully started, False otherwise
-        """
-        try:
-            # Check if share file exists or wait for it
-            if not os.path.exists(self.share_file):
-                print(f"[WARN] Share file not found yet: {self.share_file}")
-                print(f"[INFO] Waiting for tuning tool to create it...")
-                
-                # Wait up to 10 seconds for the file to appear
-                for i in range(100):
-                    if os.path.exists(self.share_file):
-                        print(f"[INFO] Share file appeared after {i * 0.1:.1f}s")
-                        break
-                    time.sleep(0.1)
-                
-                if not os.path.exists(self.share_file):
-                    print(f"[WARN] Share file still not found - will use demo mode")
-                    return False
-            
-            # Initialize the shared file tracker
-            self.tracker = SharedFileTracker(self.share_file)
-            self.running = True
-            print(f"[INFO] EyeTracker started successfully")
-            return True
-            
-        except Exception as e:
-            print(f"[ERROR] Failed to start EyeTracker: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
-    
-    def stop(self):
-        """Stop the eye tracker."""
-        self.running = False
-        print("[INFO] EyeTracker stopped")
-    
-    def calibrate(self, duration: float = 2.0):
-        """
-        Calibrate the tracker (recenter).
-        
-        Args:
-            duration: Calibration duration in seconds (ignored for file-based tracking)
-        """
-        if self.tracker:
-            print(f"[INFO] Calibrating (recentering)...")
-            self.tracker.recalibrate()
-    
-    def get_position(self) -> tuple:
-        """
-        Get the current eye position.
-        
-        Returns:
-            Tuple of (x, y, confidence) where:
-            - x, y are normalized offsets from center (-1 to 1)
-            - confidence is 0.0 to 1.0
-        """
-        if not self.tracker:
-            return (0.0, 0.0, 0.0)
-        
-        try:
-            result = self.tracker.get_pupil_position()
-            if result is None:
-                # No valid data - return last known position with low confidence
-                x, y, _ = self.last_position
-                return (x, y, 0.0)
-            
-            offset = result.get('normalized_offset', (0.0, 0.0))
-            confidence = result.get('confidence', 0.0)
-            
-            x, y = offset
-            self.last_position = (x, y, confidence)
-            return (x, y, confidence)
-            
-        except Exception as e:
-            # On error, return last position with zero confidence
-            x, y, _ = self.last_position
-            return (x, y, 0.0)
-
-
-class BasicCv2Tracker:
-    """
-    Basic OpenCV-based eye tracker (fallback option).
-    This is a minimal implementation for when the share file is not available.
-    """
-    def __init__(self, camera_id: int = 0):
-        self.camera_id = camera_id
-        self.cap = None
-        
-        if not CV2_AVAILABLE:
-            raise RuntimeError("OpenCV not available")
-        
-        print(f"[INFO] BasicCv2Tracker initializing camera {camera_id}")
-        
-    def get_pupil_position(self):
-        """
-        Get pupil position (minimal implementation).
-        Returns None - this is just a placeholder.
-        """
-        return None
 
 
 
@@ -732,7 +625,6 @@ class EyeAnimation:
 
     def _setup_eyes(self, eye_side):
         """Setup eye positions and draw static elements."""
-        # Calculate centers for left/right eyes
         if self.TWO_EYES:
             self.left_cx = self.W // 4
             self.right_cx = (3 * self.W) // 4
@@ -743,13 +635,14 @@ class EyeAnimation:
         self.cy = self.H // 2
 
         # Create pixel matrices for both eyes
+        # Each pixel entry: (canvas_item_id, center_x, center_y, current_color_zone)
+        # color_zone: 0=base, 1=mid, 2=hot - avoids redundant itemconfig calls
         self.left_pixels = []
         self.right_pixels = []
 
         for cx, pixels in [(self.left_cx, self.left_pixels),
                            (self.right_cx, self.right_pixels)]:
             if not self.TWO_EYES and cx == self.right_cx and self.left_cx == self.right_cx:
-                # Single eye mode - skip duplicate
                 if pixels is self.right_pixels:
                     continue
 
@@ -777,7 +670,7 @@ class EyeAnimation:
                             px, py, px + self.CELL, py + self.CELL,
                             outline="", fill=self.BASE_PIXEL
                         )
-                        pixels.append((item, pcx, pcy))
+                        pixels.append([item, pcx, pcy, 0])  # 0 = base zone
 
         # Create pupil dots and sparkles
         self.left_dot = self.canvas.create_oval(
@@ -832,37 +725,60 @@ class EyeAnimation:
             return dx * s, dy * s
         return dx, dy
 
-    def _pixel_color(self, d, hot=55, mid=110):
-        """Get pixel color based on distance from pupil."""
-        if d <= hot:
-            return self.HOT_PIXEL
-        if d <= mid:
-            return self.MID_PIXEL
-        return self.BASE_PIXEL
+    # Pre-computed color zone constants
+    _ZONE_BASE = 0
+    _ZONE_MID = 1
+    _ZONE_HOT = 2
+    _HOT_DIST = 55
+    _MID_DIST = 110
+    _HOT_DIST_SQ = _HOT_DIST * _HOT_DIST
+    _MID_DIST_SQ = _MID_DIST * _MID_DIST
 
     def _update_eye(self, cx, dot, spark, pixels, dx, dy):
-        """Update a single eye's position."""
+        """Update a single eye's position. Only recolors pixels whose zone changed."""
         px = cx + dx
         py = self.cy + dy
 
-        # Update pupil
         self.canvas.coords(
             dot,
             px - self.DOT_R, py - self.DOT_R,
             px + self.DOT_R, py + self.DOT_R
         )
 
-        # Update sparkle (offset for highlight effect)
         self.canvas.coords(
             spark,
             px - self.SPARK_R - 7, py - self.SPARK_R - 7,
             px + self.SPARK_R - 7, py + self.SPARK_R - 7
         )
 
-        # Update pixel matrix
-        for item, pcx, pcy in pixels:
-            d = math.hypot(pcx - px, pcy - py)
-            self.canvas.itemconfig(item, fill=self._pixel_color(d))
+        # Update pixel matrix - only call itemconfig when color zone changes
+        hot_sq = self._HOT_DIST_SQ
+        mid_sq = self._MID_DIST_SQ
+        hot_color = self.HOT_PIXEL
+        mid_color = self.MID_PIXEL
+        base_color = self.BASE_PIXEL
+        itemconfig = self.canvas.itemconfig
+
+        for pix in pixels:
+            ddx = pix[1] - px
+            ddy = pix[2] - py
+            d_sq = ddx * ddx + ddy * ddy
+
+            if d_sq <= hot_sq:
+                new_zone = 2
+            elif d_sq <= mid_sq:
+                new_zone = 1
+            else:
+                new_zone = 0
+
+            if new_zone != pix[3]:
+                pix[3] = new_zone
+                if new_zone == 2:
+                    itemconfig(pix[0], fill=hot_color)
+                elif new_zone == 1:
+                    itemconfig(pix[0], fill=mid_color)
+                else:
+                    itemconfig(pix[0], fill=base_color)
 
     def _get_demo_position(self):
         """Get demo animation position (smooth figure-8 pattern)."""
@@ -878,19 +794,21 @@ class EyeAnimation:
     def tick(self):
         """Animation tick - called every frame."""
         # Get tracking input or demo position
+        confidence = 0.0
         if self.tracker:
             track_x, track_y, confidence = self.tracker.get_position()
             if confidence > 0.3:
-                # Scale tracking to eye movement range
                 self.target_dx = track_x * self.MAX_X * TRACK_SENSITIVITY_X
                 self.target_dy = track_y * self.MAX_Y * TRACK_SENSITIVITY_Y
         elif self.demo_mode:
-            # Demo mode: automatic animation
             self.target_dx, self.target_dy = self._get_demo_position()
+            confidence = 1.0
 
-        # Smooth movement
-        self.current_dx += (self.target_dx - self.current_dx) * SMOOTHING
-        self.current_dy += (self.target_dy - self.current_dy) * SMOOTHING
+        # Adaptive smoothing: more smoothing (lower alpha) when confidence is low
+        # This reduces jitter from noisy/uncertain detections
+        alpha = SMOOTHING * (0.5 + 0.5 * min(1.0, confidence + 0.3))
+        self.current_dx += (self.target_dx - self.current_dx) * alpha
+        self.current_dy += (self.target_dy - self.current_dy) * alpha
 
         # Clamp to valid range
         dx, dy = self._clamp(self.current_dx, self.current_dy)
