@@ -1,0 +1,21 @@
+==================================================
+Eye Tracking Animation
+==================================================
+Display: HDMI-2
+Camera: 0
+Tracking: enabled
+Sensitivity: X=2.5, Y=2.0
+DISPLAY env: :0
+
+Controls:
+  ESC/q - Quit
+  c     - Recalibrate
+  d     - Toggle demo mode
+==================================================
+[INFO] Creating animation window...
+[INFO] Display target: HDMI-2 3440x1440+0+0
+[INFO] Mode: windowed 600x500+1300+100 (relative 1300+100)
+[INFO] Window created: 600x500 at +1300+100
+[INFO] Two eyes mode: False
+[INFO] Initializing eye tracker...
+[INFO] Starting animation loop...
