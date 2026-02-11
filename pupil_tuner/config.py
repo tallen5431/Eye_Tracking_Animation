@@ -40,7 +40,7 @@ class TuningParams:
     iris_smooth_alpha: float = 0.75  # Temporal smoothing (0-1)
 
     # Blob-based pupil detection (dark circular region) — robust for glasses
-    blob_dark_percentile: float = 6.0     # 3–12 typical; higher = include more pixels
+    blob_dark_percentile: float = 8.0     # 3–12 typical; higher = include more pixels
     blob_use_sat_filter: bool = True     # require low saturation to avoid skin shadows
     blob_sat_max: int = 140              # 80–180; lower = stricter gray/black
     blob_blur_kernel_size: int = 5      # gaussian blur before percentile threshold (odd 0/3/5/7)
@@ -49,10 +49,10 @@ class TuningParams:
     blob_iris_roi_erode_k: int = 0      # optional shrink ROI if too wide (odd 0/3/5)
     blob_cyan_roi_scale: float = 1.25  # scale ellipse ROI (1.05–1.60) when guiding blob detection
     blob_open_ksize: int = 5             # remove specks (odd 3–9)
-    blob_close_ksize: int = 21           # connect/fill (odd 11–35)
+    blob_close_ksize: int = 25           # connect/fill (odd 11–35)
     blob_min_area: int = 300             # reject tiny blobs
     blob_keep_top_k: int = 6             # score top candidates
-    blob_min_circularity: float = 0.40   # raise to avoid rims/edges
+    blob_min_circularity: float = 0.35   # raise to avoid rims/edges
     blob_max_aspect: float = 2.0         # reject very stretched ellipses
     blob_ellipse_scale: float = 1.05
 

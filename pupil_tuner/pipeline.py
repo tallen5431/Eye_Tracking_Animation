@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import cv2
 import numpy as np
 from .config import TuningParams, TuningToggles
@@ -37,6 +38,18 @@ def _odd(k: int, minimum: int = 0) -> int:
     return k if (k % 2 == 1) else k + 1
 
 
+_se_cache: dict[tuple[int, int], np.ndarray] = {}
+
+def _get_ellipse_se(k: int) -> np.ndarray:
+    """Get (and cache) an elliptical structuring element of size k x k."""
+    key = (k, k)
+    se = _se_cache.get(key)
+    if se is None:
+        se = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, key)
+        _se_cache[key] = se
+    return se
+
+
 def ellipse_roi_mask_u8(shape_hw, ellipse, scale=1.25, dilate_k=0, erode_k=0):
     """Create a filled elliptical ROI mask (0/255) from a cv2.fitEllipse-style tuple.
 
@@ -61,13 +74,9 @@ def ellipse_roi_mask_u8(shape_hw, ellipse, scale=1.25, dilate_k=0, erode_k=0):
     ek = int(erode_k or 0)
 
     if dk >= 3:
-        kk = _odd(dk, minimum=3)
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kk, kk))
-        mask = cv2.dilate(mask, k, iterations=1)
+        mask = cv2.dilate(mask, _get_ellipse_se(_odd(dk, minimum=3)), iterations=1)
     if ek >= 3:
-        kk = _odd(ek, minimum=3)
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kk, kk))
-        mask = cv2.erode(mask, k, iterations=1)
+        mask = cv2.erode(mask, _get_ellipse_se(_odd(ek, minimum=3)), iterations=1)
 
     return mask
 
@@ -102,23 +111,21 @@ def adjust_contrast_brightness(img: np.ndarray, alpha: float = 1.0, beta: int = 
     return adjusted
 
 
+_gamma_lut_cache: dict[float, np.ndarray] = {}
+
 def adjust_gamma(img: np.ndarray, gamma: float = 1.0) -> np.ndarray:
     """
-    Apply gamma correction.
-    
-    Args:
-        img: Input image (grayscale)
-        gamma: Gamma value (1.0 = no change, <1.0 = darker, >1.0 = brighter)
-    
-    Returns:
-        Gamma-corrected image
+    Apply gamma correction with cached LUT for repeated gamma values.
     """
     if gamma == 1.0:
         return img
-    
-    # Build lookup table
-    inv_gamma = 1.0 / float(gamma)
-    table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)], dtype=np.uint8)
+
+    # Cache the LUT so we don't rebuild it every frame
+    table = _gamma_lut_cache.get(gamma)
+    if table is None:
+        inv_gamma = 1.0 / float(gamma)
+        table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)], dtype=np.uint8)
+        _gamma_lut_cache[gamma] = table
     return cv2.LUT(img, table)
 
 
@@ -142,20 +149,19 @@ def sharpen_image(img: np.ndarray, amount: float = 0.0) -> np.ndarray:
     return sharpened
 
 
+_clahe_cache: dict[tuple[float, int], cv2.CLAHE] = {}
+
 def apply_clahe(img_u8: np.ndarray, clip_limit: float = 2.0, tile_grid_size: int = 8) -> np.ndarray:
     """
     Local-contrast enhancer (usually better than equalizeHist for eye imagery).
-    
-    Args:
-        img_u8: Input image (grayscale uint8)
-        clip_limit: CLAHE clip limit (1.0-8.0, higher = more aggressive)
-        tile_grid_size: Grid size for local regions (4-16, smaller = more local)
-    
-    Returns:
-        CLAHE-enhanced image
+    Caches the CLAHE object to avoid recreation every frame.
     """
     grid = max(4, min(16, int(tile_grid_size)))
-    clahe = cv2.createCLAHE(clipLimit=float(clip_limit), tileGridSize=(grid, grid))
+    key = (float(clip_limit), grid)
+    clahe = _clahe_cache.get(key)
+    if clahe is None:
+        clahe = cv2.createCLAHE(clipLimit=float(clip_limit), tileGridSize=(grid, grid))
+        _clahe_cache[key] = clahe
     return clahe.apply(img_u8)
 
 
@@ -174,9 +180,8 @@ def auto_canny_u8(img_u8: np.ndarray, sigma: float = 0.33) -> np.ndarray:
 
 def preprocess(gray: np.ndarray, params: TuningParams, toggles: TuningToggles) -> tuple[np.ndarray, dict]:
     """
-    ENHANCED: Step-by-step preprocessing with adjustable parameters at each stage.
-    UPDATED: Improved glare removal for glasses users.
-    
+    Step-by-step preprocessing with adjustable parameters at each stage.
+
     Pipeline:
       1. Contrast/brightness adjustment
       2. Gamma correction
@@ -184,64 +189,50 @@ def preprocess(gray: np.ndarray, params: TuningParams, toggles: TuningToggles) -
       4. Bilateral filter (optional)
       5. CLAHE (optional)
       6. Glint/glare removal (optional, enhanced for glasses)
-    
+
     Returns:
-        (processed_image, debug_images_dict)
+        (processed_image, empty_dict)
+        The dict is kept for API compatibility but no longer populated per-frame.
     """
-    debug = {}
-    img = gray.copy()
-    debug['0_original'] = img.copy()
-    
+    # All processing functions return new arrays, so no copy of gray needed.
+    img = gray
+
     # Step 1: Contrast & Brightness
     if params.contrast_alpha != 1.0 or params.brightness_beta != 0:
         img = adjust_contrast_brightness(img, params.contrast_alpha, params.brightness_beta)
-    debug['1_contrast_brightness'] = img.copy()
-    
+
     # Step 2: Gamma Correction
     if params.gamma_value != 1.0:
         img = adjust_gamma(img, params.gamma_value)
-    debug['2_gamma'] = img.copy()
-    
+
     # Step 3: Sharpening
     if params.sharpen_amount > 0.0:
         img = sharpen_image(img, params.sharpen_amount)
-    debug['3_sharpened'] = img.copy()
-    
+
     # Step 4: Bilateral Filter (noise reduction, edge-preserving)
     if toggles.use_bilateral_filter:
         img = cv2.bilateralFilter(img, 5, 50, 50)
-    debug['4_bilateral'] = img.copy()
-    
+
     # Step 5: CLAHE (local contrast enhancement)
     if toggles.use_histogram_eq:
         img = apply_clahe(img, params.clahe_clip_limit, params.clahe_grid_size)
-    debug['5_clahe'] = img.copy()
-    
+
     # Step 6: Enhanced Glint/Glare Removal
     if toggles.use_glint_removal:
         thresh = max(200, min(250, int(params.glare_threshold)))
         radius = max(3, min(10, int(params.glare_inpaint_radius)))
-        
-        # Detect glare (bright spots)
+
         _, glare_mask = cv2.threshold(img, thresh, 255, cv2.THRESH_BINARY)
-        
-        # Glasses mode: more aggressive removal
+
         if toggles.use_glasses_mode:
-            # Larger dilation to cover glare halos
-            kernel = np.ones((7, 7), np.uint8)
-            glare_mask = cv2.dilate(glare_mask, kernel, iterations=2)
+            glare_mask = cv2.dilate(glare_mask, _get_ellipse_se(7), iterations=2)
         else:
-            # Standard dilation
-            kernel = np.ones((3, 3), np.uint8)
-            glare_mask = cv2.dilate(glare_mask, kernel, iterations=1)
-        
-        # Inpaint if significant glare detected
+            glare_mask = cv2.dilate(glare_mask, _get_ellipse_se(3), iterations=1)
+
         if cv2.countNonZero(glare_mask) > 10:
             img = cv2.inpaint(img, glare_mask, radius, cv2.INPAINT_TELEA)
-    
-    debug['6_glint_removed'] = img.copy()
-    
-    return img, debug
+
+    return img, {}
 
 
 def create_iris_mask_from_sclera(gray: np.ndarray, params: TuningParams, pupil_center=None, pupil_radius=None) -> np.ndarray:
@@ -279,8 +270,8 @@ def create_iris_mask_from_sclera(gray: np.ndarray, params: TuningParams, pupil_c
     # Invert: dark regions (iris + pupil) become white
     iris_region = cv2.bitwise_not(sclera_mask)
     
-    # Clean up with morphology
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    # Clean up with morphology (cached structuring element)
+    kernel = _get_ellipse_se(5)
     iris_region = cv2.morphologyEx(iris_region, cv2.MORPH_CLOSE, kernel, iterations=2)
     iris_region = cv2.morphologyEx(iris_region, cv2.MORPH_OPEN, kernel, iterations=1)
     
@@ -320,34 +311,36 @@ def fit_iris_from_mask_and_pupil(mask: np.ndarray, pupil_ellipse, params: Tuning
     # Find largest contour near pupil center
     best = None
     best_score = 0.0
-    
+    expected_area = math.pi * expected_iris_r * expected_iris_r
+
     for c in contours:
         if len(c) < 5:
             continue
-        
+
         area = cv2.contourArea(c)
         if area < 100:
             continue
-        
-        # Check if contour contains pupil
+
         M = cv2.moments(c)
-        if M["m00"] <= 1e-6:
+        m00 = M["m00"]
+        if m00 <= 1e-6:
             continue
-        cx = M["m10"] / M["m00"]
-        cy = M["m01"] / M["m00"]
-        
-        # Distance from pupil center
-        dist = np.sqrt((cx - px)**2 + (cy - py)**2)
-        
+        cx = M["m10"] / m00
+        cy = M["m01"] / m00
+
+        # Distance from pupil center (pure Python math)
+        ddx = cx - px
+        ddy = cy - py
+        dist = math.sqrt(ddx * ddx + ddy * ddy)
+
         # Penalize contours far from pupil
         dist_score = 1.0 / (1.0 + dist / 20.0)
-        
+
         # Check size consistency
-        expected_area = np.pi * expected_iris_r * expected_iris_r
         area_ratio = min(area, expected_area) / max(area, expected_area)
-        
+
         score = dist_score * 0.4 + area_ratio * 0.6
-        
+
         if score > best_score:
             best_score = score
             best = c
@@ -399,7 +392,7 @@ def threshold(img_blurred: np.ndarray, params: TuningParams, toggles: TuningTogg
 
 def morphology(bin_img: np.ndarray, params: TuningParams) -> tuple[np.ndarray, np.ndarray]:
     k = _odd(params.morph_kernel_size, minimum=1)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    kernel = _get_ellipse_se(k)
 
     out = bin_img.copy()
     if params.morph_close_iterations > 0:
@@ -424,14 +417,16 @@ def fill_holes_u8(mask_u8: np.ndarray) -> np.ndarray:
     if m.ndim == 3:
         m = cv2.cvtColor(m, cv2.COLOR_BGR2GRAY)
 
-    # Need a copy because floodFill modifies in-place
+    # Invert: blob→0, background→255, holes_inside_blob→255
     inv = cv2.bitwise_not(m)
     h, w = inv.shape[:2]
     ff = inv.copy()
     flood_mask = np.zeros((h + 2, w + 2), np.uint8)
-    cv2.floodFill(ff, flood_mask, (0, 0), 0)  # remove background-connected "holes"
-    holes = cv2.bitwise_not(ff)               # now only holes remain
-    filled = cv2.bitwise_or(m, holes)
+    # Flood from corner zeroes out background-connected 255 pixels.
+    # After this, ff has: background→0, blob→0, internal_holes→255
+    cv2.floodFill(ff, flood_mask, (0, 0), 0)
+    # ff now contains *only* the internal holes as 255. OR with original to fill them.
+    filled = cv2.bitwise_or(m, ff)
     return filled
 
 
@@ -449,10 +444,10 @@ def keep_largest_cc(mask_u8: np.ndarray, min_area_frac: float = 0.0) -> np.ndarr
     out = np.zeros_like(mask_u8)
     out[labels == best_idx] = 255
 
-    # Optional guard: if the "largest" is still too small, return original mask
+    # Optional guard: if the largest CC is too small relative to total mask area, keep original
     if min_area_frac and min_area_frac > 0.0:
-        # (Since we're keeping only largest, this is mostly defensive)
-        if best_area < (best_area * float(min_area_frac)):
+        total_area = float(np.count_nonzero(mask_u8))
+        if total_area > 0 and best_area < (total_area * float(min_area_frac)):
             return mask_u8
     return out
 
@@ -482,21 +477,16 @@ def clean_blob_mask(blob_u8: np.ndarray, params) -> np.ndarray:
         blob = fill_holes_u8(blob)
 
     if open_k >= 3:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k, open_k))
-        blob = cv2.morphologyEx(blob, cv2.MORPH_OPEN, k, iterations=1)
+        blob = cv2.morphologyEx(blob, cv2.MORPH_OPEN, _get_ellipse_se(open_k), iterations=1)
 
     if close_k >= 3:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
-        blob = cv2.morphologyEx(blob, cv2.MORPH_CLOSE, k, iterations=1)
-    blob = clean_blob_mask(blob, params)
+        blob = cv2.morphologyEx(blob, cv2.MORPH_CLOSE, _get_ellipse_se(close_k), iterations=1)
 
     if erode_k >= 3:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (erode_k, erode_k))
-        blob = cv2.erode(blob, k, iterations=1)
+        blob = cv2.erode(blob, _get_ellipse_se(erode_k), iterations=1)
 
     if dilate_k >= 3:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate_k, dilate_k))
-        blob = cv2.dilate(blob, k, iterations=1)
+        blob = cv2.dilate(blob, _get_ellipse_se(dilate_k), iterations=1)
 
     if keep_largest:
         blob = keep_largest_cc(blob, min_area_frac=0.0)
@@ -570,75 +560,100 @@ def _contour_centroid(cnt):
     return (float(M["m10"] / M["m00"]), float(M["m01"] / M["m00"]))
 
 def _mean_intensity_in_contour(gray_f: np.ndarray, cnt) -> float:
-    # lower mean => darker. Uses cv2.mean with a contour mask.
-    mask = np.zeros(gray_f.shape[:2], dtype=np.uint8)
-    cv2.drawContours(mask, [cnt], -1, 255, -1)
-    return float(cv2.mean(gray_f, mask=mask)[0])
+    """Mean intensity inside contour. Uses bounding-rect crop for speed."""
+    x, y, w, h = cv2.boundingRect(cnt)
+    if w <= 0 or h <= 0:
+        return 255.0
+    # Work on a small ROI instead of full image
+    roi = gray_f[y:y+h, x:x+w]
+    mask_roi = np.zeros((h, w), dtype=np.uint8)
+    shifted = cnt - np.array([x, y])
+    cv2.drawContours(mask_roi, [shifted], -1, 255, -1)
+    return float(cv2.mean(roi, mask=mask_roi)[0])
 
-def detect_pupil_blob(frame_bgr: np.ndarray, params: TuningParams, iris_roi_mask_u8: np.ndarray | None = None):
+# Temporal EMA state for dark threshold smoothing (persists across frames)
+_blob_thr_ema: float | None = None
+_BLOB_THR_EMA_ALPHA = 0.3  # blend factor for threshold EMA (lower = smoother)
+
+def detect_pupil_blob(frame_bgr: np.ndarray, params: TuningParams, iris_roi_mask_u8: np.ndarray | None = None, prev_center: tuple | None = None):
     """
     Detect pupil as the darkest *circular* region.
 
+    Args:
+        frame_bgr: BGR eye image
+        params: Tuning parameters
+        iris_roi_mask_u8: Optional iris ROI mask to constrain search
+        prev_center: Optional (x, y) from previous frame for continuity bias
+
     Returns:
         (ellipse, confidence, blob_mask_u8, raw_mask_u8, debug_info)
-
-    Notes:
-    - raw_mask_u8 is the cleaned threshold mask (good for a "threshold" debug view)
-    - blob_mask_u8 is the final filled blob used to drive overlays/ellipse fit
     """
+    global _blob_thr_ema
+
     if frame_bgr is None or frame_bgr.size == 0:
         return None, 0.0, None, None, None
 
     H, W = frame_bgr.shape[:2]
 
-    # 1) grayscale + blur (use existing blur_kernel_size for speed)
-    gray = to_gray(frame_bgr).astype(np.float32)
-    gray_f = safe_gauss(gray, int(getattr(params, "blob_blur_kernel_size", 5)))
+    # 1) grayscale + blur (stay in uint8 — avoid full-frame float32 allocation)
+    gray_u8 = to_gray(frame_bgr)
+    bk = int(getattr(params, "blob_blur_kernel_size", 5))
+    gray_u8 = safe_gauss(gray_u8, bk)
 
-    # 2) dark percentile threshold (robust to exposure changes)
-    pct = float(getattr(params, "blob_dark_percentile", 6.0))
+    # 2) dark percentile threshold with temporal smoothing
+    #    Subsample 4x in each dim (~16x fewer pixels) for fast percentile
+    pct = float(getattr(params, "blob_dark_percentile", 8.0))
     pct = float(np.clip(pct, 0.5, 50.0))
-    thr = float(np.percentile(gray_f, pct))
-    mask_dark = (gray_f <= thr).astype(np.uint8) * 255
+    thr_raw = float(np.percentile(gray_u8[::4, ::4], pct))
+
+    # Smooth the threshold over time to prevent mask flickering
+    if _blob_thr_ema is None:
+        _blob_thr_ema = thr_raw
+    else:
+        _blob_thr_ema += _BLOB_THR_EMA_ALPHA * (thr_raw - _blob_thr_ema)
+    thr = _blob_thr_ema
+
+    # cv2.threshold is faster than numpy boolean + astype + multiply
+    _, mask_dark = cv2.threshold(gray_u8, int(thr), 255, cv2.THRESH_BINARY_INV)
 
     # 3) optional low-saturation filter (helps ignore dark skin shadows / glasses rims)
     if bool(getattr(params, "blob_use_sat_filter", True)):
         sat_max = int(getattr(params, "blob_sat_max", 140))
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
-        S = hsv[:, :, 1]
-        mask_lowsat = (S <= sat_max).astype(np.uint8) * 255
-        raw = cv2.bitwise_and(mask_dark, mask_lowsat)
+        _, sat_mask = cv2.threshold(hsv[:, :, 1], sat_max, 255, cv2.THRESH_BINARY_INV)
+        raw = cv2.bitwise_and(mask_dark, sat_mask)
     else:
         raw = mask_dark
+
     # Optional: restrict blob search to an iris ROI mask (from sclera segmentation).
-    # This helps avoid selecting dark glasses rims / eyelashes outside the iris region.
-    if iris_roi_mask_u8 is not None and bool(getattr(params, 'blob_use_iris_roi', True)):
-        roi = (iris_roi_mask_u8 > 0).astype(np.uint8) * 255
+    # iris_roi_mask_u8 is already 0/255 uint8 from ellipse_roi_mask_u8 — no conversion needed.
+    use_iris_roi = iris_roi_mask_u8 is not None and bool(getattr(params, 'blob_use_iris_roi', True))
+    if use_iris_roi:
+        roi = iris_roi_mask_u8
         dk = int(getattr(params, 'blob_iris_roi_dilate_k', 21))
         ek = int(getattr(params, 'blob_iris_roi_erode_k', 0))
         if dk >= 3:
-            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd(dk, minimum=3), _odd(dk, minimum=3)))
-            roi = cv2.dilate(roi, k, iterations=1)
+            roi = cv2.dilate(roi, _get_ellipse_se(_odd(dk, minimum=3)), iterations=1)
         if ek >= 3:
-            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd(ek, minimum=3), _odd(ek, minimum=3)))
-            roi = cv2.erode(roi, k, iterations=1)
+            roi = cv2.erode(roi, _get_ellipse_se(_odd(ek, minimum=3)), iterations=1)
         raw = cv2.bitwise_and(raw, roi)
 
-    # Choose a center reference for scoring (prefer blobs near iris ROI center if provided).
-    center_x, center_y = (W / 2.0), (H / 2.0)
-    if iris_roi_mask_u8 is not None and bool(getattr(params, 'blob_use_iris_roi', True)):
-        mm = cv2.moments((iris_roi_mask_u8 > 0).astype(np.uint8))
+    # Choose a center reference for scoring (prefer iris ROI center if provided).
+    center_x, center_y = W * 0.5, H * 0.5
+    if use_iris_roi:
+        # Fast path: moments of the mask to find centroid
+        mm = cv2.moments(iris_roi_mask_u8)
         if mm.get('m00', 0.0) > 1e-6:
             center_x = float(mm['m10'] / mm['m00'])
             center_y = float(mm['m01'] / mm['m00'])
 
-    # 4) morphology cleanup
+    # 4) morphology cleanup (using cached structuring elements)
     open_k = int(getattr(params, "blob_open_ksize", 5))
     close_k = int(getattr(params, "blob_close_ksize", 21))
     if open_k >= 3:
-        raw = cv2.morphologyEx(raw, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd(open_k, 3), _odd(open_k, 3))), iterations=1)
+        raw = cv2.morphologyEx(raw, cv2.MORPH_OPEN, _get_ellipse_se(_odd(open_k, 3)), iterations=1)
     if close_k >= 3:
-        raw = cv2.morphologyEx(raw, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (_odd(close_k, 3), _odd(close_k, 3))), iterations=2)
+        raw = cv2.morphologyEx(raw, cv2.MORPH_CLOSE, _get_ellipse_se(_odd(close_k, 3)), iterations=2)
 
     # 5) score candidate contours
     cnts = find_external_contours(raw)
@@ -659,6 +674,13 @@ def detect_pupil_blob(frame_bgr: np.ndarray, params: TuningParams, iris_roi_mask
     w_dark = float(getattr(params, "blob_darkness_weight", 1.8))
     w_area = float(getattr(params, "blob_area_weight", 0.0005))
 
+    # Temporal continuity: bonus for being near previous frame's detection
+    w_continuity = 4.0
+    has_prev = prev_center is not None
+    prev_cx = prev_center[0] if has_prev else 0.0
+    prev_cy = prev_center[1] if has_prev else 0.0
+    frame_diag = float(max(W, H) + 1e-6)
+
     def score(cnt) -> tuple:
         area = float(cv2.contourArea(cnt))
         if area < min_area:
@@ -672,7 +694,9 @@ def detect_pupil_blob(frame_bgr: np.ndarray, params: TuningParams, iris_roi_mask
         if c is None:
             return -1e18, None
         cx, cy = c
-        dist = float(np.hypot(cx - center_x, cy - center_y) / (max(W, H) + 1e-6))
+        ddx = cx - center_x
+        ddy = cy - center_y
+        dist = math.sqrt(ddx * ddx + ddy * ddy) / frame_diag
 
         # ellipse stretch guard
         e = None
@@ -684,16 +708,16 @@ def detect_pupil_blob(frame_bgr: np.ndarray, params: TuningParams, iris_roi_mask
         if e is not None and _ellipse_aspect(e) > max_aspect:
             return -1e18, None
 
-        mean_int = _mean_intensity_in_contour(gray_f, cnt)
+        mean_int = _mean_intensity_in_contour(gray_u8, cnt)
         dark_term = (255.0 - mean_int) / 255.0  # 0..1
 
         sol = _contour_solidity(cnt)
         ext = _contour_extent(cnt)
         thin = _contour_thinness(cnt)
 
-        # strong nonlinear circle preference
         circ_boost = circ * circ
-        thin_penalty = float(np.clip((thin - 120.0) / 200.0, 0.0, 4.0))
+        tp = (thin - 120.0) / 200.0
+        thin_penalty = max(0.0, min(4.0, tp))
 
         s = (
             (w_circ * circ_boost)
@@ -704,7 +728,17 @@ def detect_pupil_blob(frame_bgr: np.ndarray, params: TuningParams, iris_roi_mask
             - (w_center * dist)
             - (w_thin * thin_penalty)
         )
-        return float(s), {"circ": float(circ), "sol": float(sol), "ext": float(ext), "thin": float(thin), "mean_gray": float(mean_int), "dist": float(dist), "area": float(area), "dark": float(dark_term), "ellipse": e}
+
+        # Temporal continuity bonus: reward candidates near previous detection
+        if has_prev:
+            pdx = cx - prev_cx
+            pdy = cy - prev_cy
+            prev_dist = math.sqrt(pdx * pdx + pdy * pdy) / frame_diag
+            # Gaussian-like falloff: close = big bonus, far = no bonus
+            continuity = math.exp(-prev_dist * prev_dist * 50.0)
+            s += w_continuity * continuity
+
+        return float(s), {"circ": circ, "sol": sol, "ext": ext, "thin": thin, "mean_gray": mean_int, "dist": dist, "area": area, "dark": dark_term, "ellipse": e}
 
     scored = []
     for c in cnts:
@@ -733,7 +767,9 @@ def detect_pupil_blob(frame_bgr: np.ndarray, params: TuningParams, iris_roi_mask
         cv2.ellipse(blob, e2, 255, -1)
         e = e2
 
-    blob = cv2.morphologyEx(blob, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)), iterations=1)
+    # Close gaps then fill any internal holes (specular reflections, etc.)
+    blob = cv2.morphologyEx(blob, cv2.MORPH_CLOSE, _get_ellipse_se(15), iterations=2)
+    blob = fill_holes_u8(blob)
 
     # 7) final ellipse: prefer fitted ellipse; fallback to minEnclosingCircle
     ellipse = None

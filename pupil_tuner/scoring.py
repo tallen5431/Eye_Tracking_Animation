@@ -1,8 +1,11 @@
 from __future__ import annotations
+import math
 import cv2
 import numpy as np
 from dataclasses import dataclass
 from typing import Optional, List
+
+_4PI = 4.0 * math.pi
 
 @dataclass
 class ContourMeta:
@@ -32,7 +35,9 @@ def score_contours(
       - score = 0.5*circularity + 0.5*center_score
     """
     h, w = frame_shape_hw
-    center_point = np.array([w / 2.0, h / 2.0])
+    cx0 = w * 0.5
+    cy0 = h * 0.5
+    half_min = min(w, h) * 0.5
 
     best_contour = None
     best_score = 0.0
@@ -47,30 +52,33 @@ def score_contours(
         if perimeter <= 0:
             continue
 
-        circularity = 4 * np.pi * area / (perimeter * perimeter)
+        circularity = _4PI * area / (perimeter * perimeter)
         if circularity < min_circularity:
             continue
 
         M = cv2.moments(contour)
-        if M.get("m00", 0) == 0:
+        m00 = M["m00"]
+        if m00 <= 1e-6:
             continue
 
-        cx = M["m10"] / M["m00"]
-        cy = M["m01"] / M["m00"]
+        cx = M["m10"] / m00
+        cy = M["m01"] / m00
 
-        dist = np.linalg.norm(np.array([cx, cy]) - center_point)
-        center_score = 1.0 - (dist / (min(w, h) / 2.0))
+        ddx = cx - cx0
+        ddy = cy - cy0
+        dist = math.sqrt(ddx * ddx + ddy * ddy)
+        center_score = 1.0 - (dist / half_min) if half_min > 0 else 0.0
 
-        score = 0.5 * float(circularity) + 0.5 * float(center_score)
+        score = 0.5 * circularity + 0.5 * center_score
 
         label = f"S:{score:.2f} C:{circularity:.2f} A:{int(area)}"
         valid.append(ContourMeta(
             contour=contour,
-            area=float(area),
-            perimeter=float(perimeter),
-            circularity=float(circularity),
-            centroid=(float(cx), float(cy)),
-            score=float(score),
+            area=area,
+            perimeter=perimeter,
+            circularity=circularity,
+            centroid=(cx, cy),
+            score=score,
             label=label,
         ))
 
@@ -79,7 +87,7 @@ def score_contours(
             best_contour = contour
 
     valid.sort(key=lambda m: m.score, reverse=True)
-    return best_contour, float(best_score), valid
+    return best_contour, best_score, valid
 
 def fit_ellipse_if_possible(contour: Optional[np.ndarray]):
     if contour is None:

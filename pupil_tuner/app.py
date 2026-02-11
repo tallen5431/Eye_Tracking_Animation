@@ -90,8 +90,8 @@ class PupilTrackerTuner:
         self.GRID_PAD = 10
 
         # Info panel window sizing (keep it large & readable)
-        self.PANEL_W = 900  # Increased from 700
-        self.PANEL_H = 320  # Increased from 280
+        self.PANEL_W = 900
+        self.PANEL_H = 460
 
         # Whether to draw ellipse on preview windows
         self.preview_show_ellipse = True
@@ -102,6 +102,19 @@ class PupilTrackerTuner:
         # Startup calibration result (sclera-based eye ROI)
         self._calibration_result: CalibrationResult | None = None
         self._calibration_frames_needed: int = 40
+
+        # Pupil ellipse smoothing (reduces blob jumping)
+        self._pupil_ellipse_smoothed = None
+        self._pupil_smooth_alpha = 0.55  # higher = keep more of previous (0.0-1.0)
+
+        # Previous pupil center for scoring bias (passed to detect_pupil_blob)
+        self._prev_pupil_center = None
+
+        # Detection hold: keep previous ellipse for N frames when detection drops
+        self._detection_hold_frames = 0
+        self._DETECTION_HOLD_MAX = 8  # hold last good detection for up to 8 frames
+        self._held_ellipse = None
+        self._held_confidence = 0.0
 
     # ---------------------- window layout helpers ----------------------
 
@@ -117,18 +130,14 @@ class PupilTrackerTuner:
     
     def _show_in_grid(self, items, start_x=30, start_y=30, cell_w=360, cell_h=260, cols=4, pad=10):
         """
-        Render all pipeline steps into a SINGLE composite window so the OS doesn't stack
-        windows on top of each other.
-
-        items: list of (title, img_or_None)
-        - img can be BGR (preferred) or gray; None is skipped.
+        Render all pipeline steps into a SINGLE composite window.
+        Always renders every slot (with placeholder if image is None) to
+        prevent window resizing / flickering when detection drops.
+        Reuses canvas buffer across frames to avoid allocation overhead.
         """
-        # Filter to only images we actually want to show
-        vis_items = [(t, im) for (t, im) in items if im is not None]
-        if not vis_items:
+        if not items:
             return
 
-        # Ensure the composite window exists (resizable) and only move/resize once
         win = getattr(self, "PIPELINE_WINDOW_NAME", "Pupil Tuner - Pipeline")
         if not getattr(self, "_pipeline_window_ready", False):
             try:
@@ -136,32 +145,44 @@ class PupilTrackerTuner:
             except Exception:
                 pass
             self._pipeline_window_ready = True
-            # Place it once; subsequent frames just update the pixels
             try:
                 cv2.moveWindow(win, int(start_x), int(start_y))
             except Exception:
                 pass
 
-        n = len(vis_items)
+        n = len(items)
         cols = max(1, int(min(cols, n)))
         rows = int(math.ceil(n / cols))
 
-        # Canvas size
         canvas_w = pad + cols * (cell_w + pad)
         canvas_h = pad + rows * (cell_h + pad)
-        canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
 
-        # Draw each tile
-        for idx, (title, img) in enumerate(vis_items):
+        # Reuse canvas buffer if dimensions match, otherwise allocate
+        canvas = getattr(self, "_grid_canvas", None)
+        if canvas is None or canvas.shape[0] != canvas_h or canvas.shape[1] != canvas_w:
+            canvas = np.zeros((canvas_h, canvas_w, 3), dtype=np.uint8)
+            self._grid_canvas = canvas
+        else:
+            canvas[:] = 0
+
+        for idx, (title, img) in enumerate(items):
             r = idx // cols
             c = idx % cols
             x0 = pad + c * (cell_w + pad)
             y0 = pad + r * (cell_h + pad)
 
-            # Normalize to BGR uint8
-            tile = img
-            if tile is None:
+            # Always draw cell border and title so empty slots are visible
+            cv2.rectangle(canvas, (x0, y0), (x0 + cell_w, y0 + cell_h), (60, 60, 60), 1)
+            cv2.putText(canvas, str(title), (x0 + 6, y0 + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
+
+            if img is None:
+                # Dark placeholder with "no data" indicator
+                cv2.putText(canvas, "---", (x0 + cell_w // 2 - 15, y0 + cell_h // 2),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (50, 50, 50), 1, cv2.LINE_AA)
                 continue
+
+            tile = img
             if tile.ndim == 2:
                 tile = cv2.cvtColor(tile, cv2.COLOR_GRAY2BGR)
             elif tile.shape[2] == 4:
@@ -169,7 +190,6 @@ class PupilTrackerTuner:
             if tile.dtype != np.uint8:
                 tile = np.clip(tile, 0, 255).astype(np.uint8)
 
-            # Fit into cell while preserving aspect ratio
             h, w = tile.shape[:2]
             if h <= 0 or w <= 0:
                 continue
@@ -178,25 +198,10 @@ class PupilTrackerTuner:
             nh = max(1, int(h * scale))
             tile_rs = cv2.resize(tile, (nw, nh), interpolation=cv2.INTER_AREA)
 
-            # Center in the cell
             x1 = x0 + (cell_w - nw) // 2
             y1 = y0 + (cell_h - nh) // 2
             canvas[y1:y1 + nh, x1:x1 + nw] = tile_rs
 
-            # Cell outline + title text (inside the composite image)
-            cv2.rectangle(canvas, (x0, y0), (x0 + cell_w, y0 + cell_h), (60, 60, 60), 1)
-            cv2.putText(
-                canvas,
-                str(title),
-                (x0 + 6, y0 + 18),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (255, 255, 255),
-                1,
-                cv2.LINE_AA,
-            )
-
-        # Show the composite
         cv2.imshow(win, canvas)
         try:
             cv2.resizeWindow(win, int(canvas_w), int(canvas_h))
@@ -204,32 +209,43 @@ class PupilTrackerTuner:
             pass
 
     def _show_info_panel(self, title: str, panel_img: np.ndarray):
-        """Deprecated: the info panel is now shown inside the composite pipeline grid."""
-        return
+        """Show info panel in a dedicated persistent window that never hides."""
+        win = "Pupil Tuner - Controls"
+        if not getattr(self, "_info_window_ready", False):
+            try:
+                cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+            except Exception:
+                pass
+            self._info_window_ready = True
+        if panel_img is not None:
+            cv2.imshow(win, panel_img)
 
     # ---------------------- preview overlay helper ----------------------
 
     def _preview_with_ellipse(self, img, ellipse, color=(0, 255, 255), thickness=2):
         """
-        Return a copy of img with ellipse drawn on top (for preview windows).
-        If img is grayscale, converts to BGR so the overlay is visible.
+        Return img with ellipse drawn on top (for preview windows).
+        Avoids copy when no ellipse needs to be drawn.
         """
         if img is None:
             return None
 
-        # Convert gray -> BGR so overlay color shows up
+        if not self.preview_show_ellipse or ellipse is None:
+            # No overlay needed — return as-is (grid will handle gray→BGR)
+            return img
+
+        # Need to draw on it, so convert and copy
         if img.ndim == 2:
             out = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         else:
             out = img.copy()
 
-        if self.preview_show_ellipse and ellipse is not None:
-            try:
-                cv2.ellipse(out, ellipse, color, thickness)
-                (cx, cy), _, _ = ellipse
-                cv2.circle(out, (int(cx), int(cy)), 3, color, -1)
-            except Exception:
-                pass
+        try:
+            cv2.ellipse(out, ellipse, color, thickness)
+            (cx, cy), _, _ = ellipse
+            cv2.circle(out, (int(cx), int(cy)), 3, color, -1)
+        except Exception:
+            pass
 
         return out
 
@@ -413,10 +429,11 @@ class PupilTrackerTuner:
 
             cx = M["m10"] / M["m00"]
             cy = M["m01"] / M["m00"]
-            d = np.sqrt((cx - cx0) ** 2 + (cy - cy0) ** 2)
-            
+            d_sq = (cx - cx0) ** 2 + (cy - cy0) ** 2
+            half_min = min(w, h) * 0.5
+
             # Score: closer to center AND more circular = better
-            center_score = 1.0 - (d / (min(w, h) * 0.5))
+            center_score = 1.0 - (d_sq ** 0.5 / half_min) if half_min > 0 else 0.0
             score = center_score * 0.6 + circularity * 0.4
 
             if score > best_score:
@@ -684,32 +701,44 @@ class PupilTrackerTuner:
                 )
             self.img_iris_roi_mask = iris_roi_mask
 
-            pupil_ellipse, pupil_conf, pupil_blob, raw_mask, _info = detect_pupil_blob(roi_bgr, self.params, iris_roi_mask_u8=iris_roi_mask)
+            pupil_ellipse, pupil_conf, pupil_blob, raw_mask, _info = detect_pupil_blob(
+                roi_bgr, self.params,
+                iris_roi_mask_u8=iris_roi_mask,
+                prev_center=self._prev_pupil_center,
+            )
 
-            # Debug views: keep the existing window meanings:
-            #   Stage 4 ("Threshold")   -> raw_mask
-            #   Stage 5 ("Morphology")  -> final filled blob
+            # Smooth the pupil ellipse to reduce frame-to-frame jumping
+            if pupil_ellipse is not None:
+                self._pupil_ellipse_smoothed = self._smooth_ellipse(
+                    self._pupil_ellipse_smoothed, pupil_ellipse,
+                    alpha=self._pupil_smooth_alpha,
+                )
+                pupil_ellipse = self._pupil_ellipse_smoothed
+                self._prev_pupil_center = (pupil_ellipse[0][0], pupil_ellipse[0][1])
+
+            # Debug views
             self.img_threshold = raw_mask
             self.img_morphology = pupil_blob
 
-            # Use the detected ellipse for downstream (sharing + iris anchor)
             bin_img = (pupil_blob if (pupil_blob is not None and np.count_nonzero(pupil_blob) > 0) else (raw_mask if raw_mask is not None else self._binary_for_pupil(self.img_preprocessed)))
             min_area = int(self.params.min_area)
             max_area = int(self.params.max_area)
 
-        # Prefer external contours to avoid selecting hole contours
-        ext_contours = find_external_contours(bin_img)
-
         if self.detect_mode != "iris":
-            # Blob mode: use the filled blob (already cleaned in detect_pupil_blob) as the truth.
-            # This avoids unstable scoring against eyelids / lashes / glasses rims.
-            best_contour = max(ext_contours, key=cv2.contourArea) if ext_contours else None
+            # Blob mode: use the smoothed pupil ellipse directly.
+            # Skip redundant contour finding — detect_pupil_blob already did it.
+            best_contour = None
             best_score = float(pupil_conf or 0.0)
             metas = []
-            ellipse = pupil_ellipse if pupil_ellipse is not None else fit_ellipse_if_possible(best_contour)
+            ellipse = pupil_ellipse
+            if ellipse is None and bin_img is not None:
+                ext_contours = find_external_contours(bin_img)
+                best_contour = max(ext_contours, key=cv2.contourArea) if ext_contours else None
+                ellipse = fit_ellipse_if_possible(best_contour)
 
         else:
             # Iris mode: contour -> center-pick -> fallback scorer
+            ext_contours = find_external_contours(bin_img)
             best_contour = self._pick_contour_near_center(
                 ext_contours,
                 shape_hw=roi_bgr.shape[:2],
@@ -731,6 +760,18 @@ class PupilTrackerTuner:
                 metas = []
 
             ellipse = fit_ellipse_if_possible(best_contour)
+
+        # Detection hold: if ellipse is lost, reuse previous for a few frames
+        if ellipse is not None:
+            self._held_ellipse = ellipse
+            self._held_confidence = float(best_score)
+            self._detection_hold_frames = 0
+        else:
+            self._detection_hold_frames += 1
+            if self._detection_hold_frames <= self._DETECTION_HOLD_MAX and self._held_ellipse is not None:
+                ellipse = self._held_ellipse
+                # Decay confidence while holding so shared tracker knows it's stale
+                best_score = self._held_confidence * max(0.0, 1.0 - self._detection_hold_frames * 0.12)
 
         # Compute iris ellipse AFTER we have pupil ellipse
         self.iris_ellipse = self._fit_iris_ellipse_simple(self.img_preprocessed, ellipse)
@@ -939,12 +980,6 @@ class PupilTrackerTuner:
                 elif key == ord(';'):
                     self.params.gamma_value = min(2.0, self.params.gamma_value + 0.1)
                     print(f"[IMG] Gamma: {self.params.gamma_value:.1f}")
-                elif key == ord('['):
-                    self.params.sharpen_amount = max(0.0, self.params.sharpen_amount - 0.2)
-                    print(f"[IMG] Sharpen: {self.params.sharpen_amount:.1f}")
-                elif key == ord(']'):
-                    self.params.sharpen_amount = min(2.0, self.params.sharpen_amount + 0.2)
-                    print(f"[IMG] Sharpen: {self.params.sharpen_amount:.1f}")
                 elif key == ord('\\'):
                     self.params.clahe_clip_limit = max(1.0, self.params.clahe_clip_limit - 0.5)
                     print(f"[IMG] CLAHE Clip: {self.params.clahe_clip_limit:.1f}")
