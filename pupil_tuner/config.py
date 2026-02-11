@@ -38,6 +38,8 @@ class TuningParams:
     iris_sclera_threshold: int = 180  # Brightness threshold for sclera (white)
     iris_expand_ratio: float = 2.5  # Iris radius = pupil_radius * this
     iris_smooth_alpha: float = 0.75  # Temporal smoothing (0-1)
+    iris_glint_threshold: int = 240  # Specular highlights above this are suppressed before sclera threshold
+    iris_mask_close_k: int = 17  # Close kernel for iris mask (bridges glare gaps; odd, 5-25)
 
     # Blob-based pupil detection (dark circular region) — robust for glasses
     blob_dark_percentile: float = 8.0     # 3–12 typical; higher = include more pixels

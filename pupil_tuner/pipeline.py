@@ -258,26 +258,42 @@ def create_iris_mask_from_sclera(gray: np.ndarray, params: TuningParams, pupil_c
     """
     if gray is None:
         return None
-    
+
     # Blur to reduce noise (more blur = smoother boundaries)
     k = max(3, int(params.iris_blur) | 1)  # Force odd
     blurred = cv2.GaussianBlur(gray, (k, k), 0)
-    
+
+    # Suppress specular highlights (monitor glare) before sclera threshold.
+    # Glints are very bright, small spots that would punch holes in the iris
+    # mask because they exceed the sclera threshold.  Replace them with
+    # the surrounding neighbourhood median so they fall below the threshold.
+    glint_thr = int(getattr(params, "iris_glint_threshold", 240))
+    _, glint_mask = cv2.threshold(blurred, glint_thr, 255, cv2.THRESH_BINARY)
+    if cv2.countNonZero(glint_mask) > 0:
+        # Dilate to cover bright halos around each glint
+        glint_mask = cv2.dilate(glint_mask, _get_ellipse_se(5), iterations=1)
+        # Median blur of the neighbourhood — only computed when glints exist
+        median = cv2.medianBlur(blurred, 15)
+        blurred[glint_mask > 0] = median[glint_mask > 0]
+
     # Threshold: anything brighter than this is sclera (exclude it)
     thresh_val = max(100, min(220, int(params.iris_sclera_threshold)))
     _, sclera_mask = cv2.threshold(blurred, thresh_val, 255, cv2.THRESH_BINARY)
-    
+
     # Invert: dark regions (iris + pupil) become white
     iris_region = cv2.bitwise_not(sclera_mask)
-    
-    # Clean up with morphology (cached structuring element)
-    kernel = _get_ellipse_se(5)
-    iris_region = cv2.morphologyEx(iris_region, cv2.MORPH_CLOSE, kernel, iterations=2)
-    iris_region = cv2.morphologyEx(iris_region, cv2.MORPH_OPEN, kernel, iterations=1)
-    
-    # Fill holes (important: iris might have reflections)
+
+    # Close with a kernel large enough to bridge any remaining glare gaps
+    close_k = _odd(int(getattr(params, "iris_mask_close_k", 17)), minimum=5)
+    iris_region = cv2.morphologyEx(iris_region, cv2.MORPH_CLOSE,
+                                   _get_ellipse_se(close_k), iterations=2)
+    # Small open to remove noise specks without eroding the iris boundary
+    iris_region = cv2.morphologyEx(iris_region, cv2.MORPH_OPEN,
+                                   _get_ellipse_se(5), iterations=1)
+
+    # Fill any remaining internal holes (reflections that survived)
     iris_region = fill_holes_u8(iris_region)
-    
+
     return iris_region
 
 
@@ -347,13 +363,17 @@ def fit_iris_from_mask_and_pupil(mask: np.ndarray, pupil_ellipse, params: Tuning
     
     if best is None or len(best) < 5:
         return None, 0.0
-    
-    # Fit ellipse
+
+    # Use convex hull before fitting — fills concavities caused by glare
+    # holes so the fitted ellipse better represents the full iris boundary.
+    hull = cv2.convexHull(best)
+    fit_pts = hull if len(hull) >= 5 else best
+
     try:
-        ellipse = cv2.fitEllipse(best)
+        ellipse = cv2.fitEllipse(fit_pts)
         confidence = float(best_score)
         return ellipse, confidence
-    except:
+    except Exception:
         return None, 0.0
 
 
