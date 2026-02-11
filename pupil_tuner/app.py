@@ -25,6 +25,14 @@ from .scoring import find_contours, score_contours, fit_ellipse_if_possible
 from .overlay import contours_view, eye_overlay, info_panel
 from .sharing import ShareWriter
 
+from calibration import (
+    CalibrationConfig,
+    CalibrationResult,
+    calibrate_from_frames,
+    load_calibration,
+    save_calibration,
+)
+
 
 class PupilTrackerTuner:
     """
@@ -90,6 +98,10 @@ class PupilTrackerTuner:
 
         # Iris ellipse smoothing (reduces jitter)
         self._iris_ellipse_smoothed = None
+
+        # Startup calibration result (sclera-based eye ROI)
+        self._calibration_result: CalibrationResult | None = None
+        self._calibration_frames_needed: int = 40
 
     # ---------------------- window layout helpers ----------------------
 
@@ -233,6 +245,101 @@ class PupilTrackerTuner:
         except Exception as e:
             print(f"Failed to open camera: {e}")
             return False
+
+    def _run_startup_calibration(self) -> None:
+        """
+        Run sclera-based calibration using the already-open camera.
+
+        Captures a burst of frames, detects sclera regions, and fits an
+        ellipse around the eye area.  The resulting ellipse seeds
+        ``_iris_ellipse_smoothed`` so the blob detector has a constrained
+        search region from the very first tracking frame.
+        """
+        from .pipeline import rotate_frame
+
+        cal_cfg = CalibrationConfig(camera_id=self.camera_id)
+
+        # Try loading a cached calibration first
+        cached = load_calibration(cal_cfg.save_path)
+        if cached is not None and cached.ellipse_roi is not None:
+            self._calibration_result = cached
+            self._seed_iris_from_calibration()
+            print(f"[CALIBRATION] Loaded cached ROI from {cal_cfg.save_path}")
+            return
+
+        if self.cap is None or not self.cap.isOpened():
+            print("[CALIBRATION] Camera not available, skipping calibration")
+            return
+
+        print("[CALIBRATION] Capturing startup frames...")
+        frames = []
+        warmup = 10
+        for _ in range(warmup):
+            self.cap.read()
+
+        t0 = time.time()
+        grabbed = 0
+        target = self._calibration_frames_needed
+
+        while len(frames) < target:
+            if (time.time() - t0) > cal_cfg.max_capture_seconds:
+                break
+            ok, frame = self.cap.read()
+            if not ok or frame is None:
+                continue
+            grabbed += 1
+
+            # Apply the same rotation the main pipeline uses
+            if self.runtime.camera_rotation != 0:
+                frame = rotate_frame(frame, self.runtime.camera_rotation)
+
+            # Extract center ROI so calibration operates in the same coordinate
+            # space as the tracking pipeline.
+            roi, _ = self.get_roi(frame)
+            frames.append(roi)
+
+        if len(frames) < 8:
+            print(f"[CALIBRATION] Too few frames ({len(frames)}), skipping")
+            return
+
+        try:
+            result = calibrate_from_frames(frames, cal_cfg)
+        except Exception as exc:
+            print(f"[CALIBRATION] Failed: {exc}")
+            return
+
+        if result.ellipse_roi is None:
+            print("[CALIBRATION] Could not fit ellipse, skipping")
+            return
+
+        self._calibration_result = result
+        self._seed_iris_from_calibration()
+
+        # Persist for future runs
+        try:
+            save_calibration(result, cal_cfg.save_path)
+            print(f"[CALIBRATION] Saved ROI to {cal_cfg.save_path}")
+        except Exception as exc:
+            print(f"[CALIBRATION] Could not save: {exc}")
+
+        (cx, cy), (MA, ma), ang = result.ellipse_roi
+        print(f"[CALIBRATION] Eye ROI ellipse: center=({cx:.0f},{cy:.0f}) "
+              f"axes=({MA:.0f},{ma:.0f}) angle={ang:.0f}°")
+
+    def _seed_iris_from_calibration(self) -> None:
+        """
+        Use the calibration ellipse to seed the iris tracker so that the
+        blob detector is constrained from the very first tracking frame.
+        """
+        if self._calibration_result is None:
+            return
+        ell = self._calibration_result.ellipse_roi
+        if ell is None:
+            return
+        # Only seed if no iris ellipse has been established yet
+        if self._iris_ellipse_smoothed is None:
+            self._iris_ellipse_smoothed = ell
+            self.iris_ellipse = ell
 
     def get_roi(self, frame_bgr: np.ndarray):
         """Extract ROI, handling rotated frames properly."""
@@ -646,6 +753,9 @@ class PupilTrackerTuner:
         if not self.initialize_camera():
             print("Failed to initialize camera")
             return
+
+        # Run sclera-based calibration to seed the iris tracker ROI
+        self._run_startup_calibration()
 
         try:
             while True:
