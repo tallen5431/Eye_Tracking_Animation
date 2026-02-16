@@ -44,13 +44,14 @@ class PupilTrackerTuner:
       - IRIS : edge-based (limbus boundary)
     """
 
-    def __init__(self, camera_id: int = 0):
+    def __init__(self, camera_id: int = 0, cap=None):
         self.params = TuningParams()
         self.toggles = TuningToggles()
         self.views = ViewFlags()
         self.runtime = RuntimeConfig(camera_id=camera_id)
 
-        self.cap = None
+        self.cap = cap
+        self._owns_camera = cap is None
         self.camera_id = camera_id
 
         # Debug images - main pipeline
@@ -254,9 +255,14 @@ class PupilTrackerTuner:
     # ------------------------------------------------------------------
 
     def initialize_camera(self) -> bool:
+        if self.cap is not None and self.cap.isOpened():
+            print(f"Using shared camera (ID: {self.camera_id})")
+            print(f"Camera rotation: {self.runtime.camera_rotation}° CCW")
+            return True
         try:
             self.cap, actual_id = open_camera(self.camera_id)
             self.camera_id = actual_id
+            self._owns_camera = True
             print(f"Camera opened successfully (ID: {self.camera_id})")
             print(f"Camera rotation: {self.runtime.camera_rotation}° CCW")
             return True
@@ -842,6 +848,197 @@ class PupilTrackerTuner:
         )
         self.current_confidence = conf
 
+    # ---------------------- per-frame display ----------------------
+
+    def process_and_display(self, frame):
+        """Process one frame and update all display windows (no camera read)."""
+        roi, _ = self.get_roi(frame)
+        self.process_pipeline(roi)
+        self.share_writer.maybe_write(
+            self.current_ellipse, self.current_confidence, roi.shape[:2]
+        )
+        self.update_fps()
+
+        panel = info_panel(
+            fps=self.fps,
+            params=self.params,
+            toggles=self.toggles,
+            has_detection=self.current_ellipse is not None,
+            confidence=self.current_confidence,
+            valid_contours=len(self.detected_contours),
+            detect_mode=self.detect_mode,
+            width=self.PANEL_W,
+            height=self.PANEL_H,
+        )
+
+        title0 = f"0. EYE TRACKING OVERLAY  [{self.detect_mode.upper()}]"
+        stage4_title = "4. Edges (Canny)" if self.detect_mode == "iris" else "4. Threshold"
+        stage4_img = self.img_edges if self.detect_mode == "iris" else self.img_threshold
+
+        e = self.current_ellipse
+        roi_vis = self._preview_with_ellipse(roi, e)
+        gray_vis = self._preview_with_ellipse(self.img_gray, e)
+        ie = getattr(self, 'iris_ellipse', None)
+        prep_vis = self._preview_with_ellipse(self.img_preprocessed, ie, color=(255, 255, 0), thickness=2)
+        prep_vis = self._preview_with_ellipse(prep_vis, e, color=(0, 255, 255), thickness=1)
+        stage4_vis = self._preview_with_ellipse(stage4_img, e)
+        morph_vis = self._preview_with_ellipse(self.img_morphology, e)
+
+        iris_mask_vis = self._preview_with_ellipse(
+            self.img_iris_mask, ie, color=(0, 255, 255), thickness=2
+        ) if self.img_iris_mask is not None else None
+
+        items = [
+            (title0, self.img_eye_overlay),
+            ("1. Original ROI", roi_vis if self.views.show_original else None),
+            ("2. Grayscale", gray_vis if self.views.show_grayscale else None),
+            ("3. Preprocessed", prep_vis if self.views.show_preprocessed else None),
+            (stage4_title, stage4_vis if self.views.show_threshold else None),
+            ("5. Morphology", morph_vis if self.views.show_morphology else None),
+            ("6. Iris Mask", iris_mask_vis if self.views.show_iris_mask else None),
+            ("7. Contours", self.img_contours if self.views.show_contours else None),
+        ]
+
+        self._show_in_grid(
+            items,
+            start_x=self.GRID_START_X,
+            start_y=self.GRID_START_Y,
+            cell_w=self.GRID_CELL_W,
+            cell_h=self.GRID_CELL_H,
+            cols=self.GRID_COLS,
+            pad=self.GRID_PAD,
+        )
+
+        self._show_info_panel("8. Parameters & Info", panel)
+
+    def handle_key(self, key: int) -> bool:
+        """Handle keyboard input. Returns True if user wants to quit."""
+        if key == 255:
+            return False
+        if key == ord('q') or key == 27:
+            return True
+        elif key == ord('m'):
+            self.detect_mode = "iris" if self.detect_mode == "pupil" else "pupil"
+            print(f"[MODE] Now tracking: {self.detect_mode.upper()}")
+        elif key == ord('r'):
+            self.reset_defaults()
+        elif key == ord('s'):
+            self.save_calibration()
+        elif key == ord('+') or key == ord('='):
+            self.params.threshold_value = min(255, self.params.threshold_value + 1)
+        elif key == ord('-') or key == ord('_'):
+            self.params.threshold_value = max(0, self.params.threshold_value - 1)
+        elif key == ord('a'):
+            self.toggles.use_auto_threshold = not self.toggles.use_auto_threshold
+            if self.toggles.use_auto_threshold:
+                self.toggles.use_adaptive_threshold = False
+        elif key == ord('d'):
+            self.toggles.use_adaptive_threshold = not self.toggles.use_adaptive_threshold
+            if self.toggles.use_adaptive_threshold:
+                self.toggles.use_auto_threshold = False
+        elif key == ord('z'):
+            self.params.min_area = max(0, self.params.min_area - 50)
+        elif key == ord('x'):
+            self.params.min_area = min(50000, self.params.min_area + 50)
+        elif key == ord('c'):
+            self.params.max_area = max(0, self.params.max_area - 50)
+        elif key == ord('v'):
+            self.params.max_area = min(500000, self.params.max_area + 50)
+        elif key == ord('b'):
+            self.params.min_circularity = max(0.0, self.params.min_circularity - 0.05)
+        elif key == ord('n'):
+            self.params.min_circularity = min(1.0, self.params.min_circularity + 0.05)
+        elif key == ord('1'):
+            self.params.blur_kernel_size = max(1, self.params.blur_kernel_size - 2)
+        elif key == ord('2'):
+            self.params.blur_kernel_size = min(15, self.params.blur_kernel_size + 2)
+        elif key == ord('3'):
+            self.params.morph_close_iterations = max(0, self.params.morph_close_iterations - 1)
+        elif key == ord('4'):
+            self.params.morph_close_iterations = min(5, self.params.morph_close_iterations + 1)
+        elif key == ord('5'):
+            self.params.morph_open_iterations = max(0, self.params.morph_open_iterations - 1)
+        elif key == ord('6'):
+            self.params.morph_open_iterations = min(5, self.params.morph_open_iterations + 1)
+        elif key == ord('7'):
+            self.params.morph_kernel_size = max(1, self.params.morph_kernel_size - 2)
+        elif key == ord('8'):
+            self.params.morph_kernel_size = min(31, self.params.morph_kernel_size + 2)
+        elif key == ord('i'):
+            self.params.iris_sclera_threshold = max(100, self.params.iris_sclera_threshold - 10)
+            print(f"[IRIS] Sclera threshold: {self.params.iris_sclera_threshold}")
+        elif key == ord('o'):
+            self.params.iris_sclera_threshold = min(220, self.params.iris_sclera_threshold + 10)
+            print(f"[IRIS] Sclera threshold: {self.params.iris_sclera_threshold}")
+        elif key == ord('k'):
+            self.params.iris_blur = max(3, self.params.iris_blur - 2)
+            print(f"[IRIS] Blur: {self.params.iris_blur}")
+        elif key == ord('l'):
+            self.params.iris_blur = min(15, self.params.iris_blur + 2)
+            print(f"[IRIS] Blur: {self.params.iris_blur}")
+        elif key == ord('['):
+            self.params.iris_expand_ratio = max(1.5, self.params.iris_expand_ratio - 0.1)
+            print(f"[IRIS] Expand ratio: {self.params.iris_expand_ratio:.1f}")
+        elif key == ord(']'):
+            self.params.iris_expand_ratio = min(4.0, self.params.iris_expand_ratio + 0.1)
+            print(f"[IRIS] Expand ratio: {self.params.iris_expand_ratio:.1f}")
+        elif key == ord('h'):
+            self.toggles.use_histogram_eq = not self.toggles.use_histogram_eq
+        elif key == ord('g'):
+            self.toggles.use_glint_removal = not self.toggles.use_glint_removal
+        elif key == ord('f'):
+            self.toggles.use_bilateral_filter = not self.toggles.use_bilateral_filter
+        elif key == ord('w'):
+            self.toggles.use_glasses_mode = not self.toggles.use_glasses_mode
+            print(f"[GLASSES MODE] {'ON' if self.toggles.use_glasses_mode else 'OFF'}")
+        elif key == ord('e'):
+            self.params.glare_threshold = max(200, self.params.glare_threshold - 10)
+            print(f"[GLARE] Threshold: {self.params.glare_threshold}")
+        elif key == ord('t'):
+            self.params.glare_threshold = min(250, self.params.glare_threshold + 10)
+            print(f"[GLARE] Threshold: {self.params.glare_threshold}")
+        elif key == ord('y'):
+            self.params.glare_inpaint_radius = max(3, self.params.glare_inpaint_radius - 1)
+            print(f"[GLARE] Inpaint radius: {self.params.glare_inpaint_radius}")
+        elif key == ord('u'):
+            self.params.glare_inpaint_radius = min(10, self.params.glare_inpaint_radius + 1)
+            print(f"[GLARE] Inpaint radius: {self.params.glare_inpaint_radius}")
+        elif key == ord('9'):
+            self.params.contrast_alpha = max(0.5, self.params.contrast_alpha - 0.1)
+            print(f"[IMG] Contrast: {self.params.contrast_alpha:.1f}")
+        elif key == ord('0'):
+            self.params.contrast_alpha = min(3.0, self.params.contrast_alpha + 0.1)
+            print(f"[IMG] Contrast: {self.params.contrast_alpha:.1f}")
+        elif key == ord(','):
+            self.params.brightness_beta = max(-100, self.params.brightness_beta - 10)
+            print(f"[IMG] Brightness: {self.params.brightness_beta:+d}")
+        elif key == ord('.'):
+            self.params.brightness_beta = min(100, self.params.brightness_beta + 10)
+            print(f"[IMG] Brightness: {self.params.brightness_beta:+d}")
+        elif key == ord('/'):
+            self.params.gamma_value = max(0.5, self.params.gamma_value - 0.1)
+            print(f"[IMG] Gamma: {self.params.gamma_value:.1f}")
+        elif key == ord(';'):
+            self.params.gamma_value = min(2.0, self.params.gamma_value + 0.1)
+            print(f"[IMG] Gamma: {self.params.gamma_value:.1f}")
+        elif key == ord('\\'):
+            self.params.clahe_clip_limit = max(1.0, self.params.clahe_clip_limit - 0.5)
+            print(f"[IMG] CLAHE Clip: {self.params.clahe_clip_limit:.1f}")
+        elif key == ord("'"):
+            self.params.clahe_clip_limit = min(8.0, self.params.clahe_clip_limit + 0.5)
+            print(f"[IMG] CLAHE Clip: {self.params.clahe_clip_limit:.1f}")
+        elif key == ord(' '):
+            all_on = self.views.show_original and self.views.show_grayscale
+            self.views.show_original = not all_on
+            self.views.show_grayscale = not all_on
+            self.views.show_preprocessed = not all_on
+            self.views.show_threshold = not all_on
+            self.views.show_morphology = not all_on
+            self.views.show_contours = not all_on
+        return False
+
+    # ---------------------- main loop ----------------------
+
     def run(self):
         # Setup signal handlers for graceful shutdown
         def signal_handler(signum, frame):
@@ -872,12 +1069,7 @@ class PupilTrackerTuner:
                 if not ret:
                     break
 
-                roi, _ = self.get_roi(frame)
-
-                self.process_pipeline(roi)
-                self.share_writer.maybe_write(self.current_ellipse, self.current_confidence, roi.shape[:2])
-
-                self.update_fps()
+                self.process_and_display(frame)
 
                 # Auto-save calibration periodically
                 if time.time() - last_autosave > autosave_interval:
@@ -887,183 +1079,9 @@ class PupilTrackerTuner:
                     except Exception as e:
                         print(f"[WARN] Auto-save failed: {e}")
 
-                # Build panel image (larger + includes mode)
-                panel = info_panel(
-                    fps=self.fps,
-                    params=self.params,
-                    toggles=self.toggles,
-                    has_detection=self.current_ellipse is not None,
-                    confidence=self.current_confidence,
-                    valid_contours=len(self.detected_contours),
-                    detect_mode=self.detect_mode,
-                    width=self.PANEL_W,
-                    height=self.PANEL_H,
-                )
-
-                title0 = f"0. EYE TRACKING OVERLAY  [{self.detect_mode.upper()}]"
-                stage4_title = "4. Edges (Canny)" if self.detect_mode == "iris" else "4. Threshold"
-                stage4_img = self.img_edges if self.detect_mode == "iris" else self.img_threshold
-
-                # Overlay ellipse on preview images
-                e = self.current_ellipse
-                roi_vis = self._preview_with_ellipse(roi, e)
-                gray_vis = self._preview_with_ellipse(self.img_gray, e)
-                ie = getattr(self, 'iris_ellipse', None)
-                prep_vis = self._preview_with_ellipse(self.img_preprocessed, ie, color=(255, 255, 0), thickness=2)
-                prep_vis = self._preview_with_ellipse(prep_vis, e, color=(0, 255, 255), thickness=1)
-                stage4_vis = self._preview_with_ellipse(stage4_img, e)
-                morph_vis = self._preview_with_ellipse(self.img_morphology, e)
-
-                iris_mask_vis = self._preview_with_ellipse(
-                    self.img_iris_mask, ie, color=(0, 255, 255), thickness=2
-                ) if self.img_iris_mask is not None else None
-
-                items = [
-                    (title0, self.img_eye_overlay),
-                    ("1. Original ROI", roi_vis if self.views.show_original else None),
-                    ("2. Grayscale", gray_vis if self.views.show_grayscale else None),
-                    ("3. Preprocessed", prep_vis if self.views.show_preprocessed else None),
-                    (stage4_title, stage4_vis if self.views.show_threshold else None),
-                    ("5. Morphology", morph_vis if self.views.show_morphology else None),
-                    ("6. Iris Mask", iris_mask_vis if self.views.show_iris_mask else None),
-                    ("7. Contours", self.img_contours if self.views.show_contours else None),
-                ]
-
-                self._show_in_grid(
-                    items,
-                    start_x=self.GRID_START_X,
-                    start_y=self.GRID_START_Y,
-                    cell_w=self.GRID_CELL_W,
-                    cell_h=self.GRID_CELL_H,
-                    cols=self.GRID_COLS,
-                    pad=self.GRID_PAD,
-                )
-
-                # Dedicated info panel window (prevents cut-off)
-                self._show_info_panel("8. Parameters & Info", panel)
-
                 key = cv2.waitKey(1) & 0xFF
-
-                if key == ord('q') or key == 27:
+                if self.handle_key(key):
                     break
-                elif key == ord('m'):
-                    self.detect_mode = "iris" if self.detect_mode == "pupil" else "pupil"
-                    print(f"[MODE] Now tracking: {self.detect_mode.upper()}")
-                elif key == ord('r'):
-                    self.reset_defaults()
-                elif key == ord('s'):
-                    self.save_calibration()
-                elif key == ord('+') or key == ord('='):
-                    self.params.threshold_value = min(255, self.params.threshold_value + 1)
-                elif key == ord('-') or key == ord('_'):
-                    self.params.threshold_value = max(0, self.params.threshold_value - 1)
-                elif key == ord('a'):
-                    self.toggles.use_auto_threshold = not self.toggles.use_auto_threshold
-                    if self.toggles.use_auto_threshold:
-                        self.toggles.use_adaptive_threshold = False
-                elif key == ord('d'):
-                    self.toggles.use_adaptive_threshold = not self.toggles.use_adaptive_threshold
-                    if self.toggles.use_adaptive_threshold:
-                        self.toggles.use_auto_threshold = False
-                elif key == ord('z'):
-                    self.params.min_area = max(0, self.params.min_area - 50)
-                elif key == ord('x'):
-                    self.params.min_area = min(50000, self.params.min_area + 50)
-                elif key == ord('c'):
-                    self.params.max_area = max(0, self.params.max_area - 50)
-                elif key == ord('v'):
-                    self.params.max_area = min(500000, self.params.max_area + 50)
-                elif key == ord('b'):
-                    self.params.min_circularity = max(0.0, self.params.min_circularity - 0.05)
-                elif key == ord('n'):
-                    self.params.min_circularity = min(1.0, self.params.min_circularity + 0.05)
-                elif key == ord('1'):
-                    self.params.blur_kernel_size = max(1, self.params.blur_kernel_size - 2)
-                elif key == ord('2'):
-                    self.params.blur_kernel_size = min(15, self.params.blur_kernel_size + 2)
-                elif key == ord('3'):
-                    self.params.morph_close_iterations = max(0, self.params.morph_close_iterations - 1)
-                elif key == ord('4'):
-                    self.params.morph_close_iterations = min(5, self.params.morph_close_iterations + 1)
-                elif key == ord('5'):
-                    self.params.morph_open_iterations = max(0, self.params.morph_open_iterations - 1)
-                elif key == ord('6'):
-                    self.params.morph_open_iterations = min(5, self.params.morph_open_iterations + 1)
-                elif key == ord('7'):
-                    self.params.morph_kernel_size = max(1, self.params.morph_kernel_size - 2)
-                elif key == ord('8'):
-                    self.params.morph_kernel_size = min(31, self.params.morph_kernel_size + 2)
-                elif key == ord('i'):
-                    self.params.iris_sclera_threshold = max(100, self.params.iris_sclera_threshold - 10)
-                    print(f"[IRIS] Sclera threshold: {self.params.iris_sclera_threshold}")
-                elif key == ord('o'):
-                    self.params.iris_sclera_threshold = min(220, self.params.iris_sclera_threshold + 10)
-                    print(f"[IRIS] Sclera threshold: {self.params.iris_sclera_threshold}")
-                elif key == ord('k'):
-                    self.params.iris_blur = max(3, self.params.iris_blur - 2)
-                    print(f"[IRIS] Blur: {self.params.iris_blur}")
-                elif key == ord('l'):
-                    self.params.iris_blur = min(15, self.params.iris_blur + 2)
-                    print(f"[IRIS] Blur: {self.params.iris_blur}")
-                elif key == ord('['):
-                    self.params.iris_expand_ratio = max(1.5, self.params.iris_expand_ratio - 0.1)
-                    print(f"[IRIS] Expand ratio: {self.params.iris_expand_ratio:.1f}")
-                elif key == ord(']'):
-                    self.params.iris_expand_ratio = min(4.0, self.params.iris_expand_ratio + 0.1)
-                    print(f"[IRIS] Expand ratio: {self.params.iris_expand_ratio:.1f}")
-                elif key == ord('h'):
-                    self.toggles.use_histogram_eq = not self.toggles.use_histogram_eq
-                elif key == ord('g'):
-                    self.toggles.use_glint_removal = not self.toggles.use_glint_removal
-                elif key == ord('f'):
-                    self.toggles.use_bilateral_filter = not self.toggles.use_bilateral_filter
-                elif key == ord('w'):
-                    self.toggles.use_glasses_mode = not self.toggles.use_glasses_mode
-                    print(f"[GLASSES MODE] {'ON' if self.toggles.use_glasses_mode else 'OFF'}")
-                elif key == ord('e'):
-                    self.params.glare_threshold = max(200, self.params.glare_threshold - 10)
-                    print(f"[GLARE] Threshold: {self.params.glare_threshold}")
-                elif key == ord('t'):
-                    self.params.glare_threshold = min(250, self.params.glare_threshold + 10)
-                    print(f"[GLARE] Threshold: {self.params.glare_threshold}")
-                elif key == ord('y'):
-                    self.params.glare_inpaint_radius = max(3, self.params.glare_inpaint_radius - 1)
-                    print(f"[GLARE] Inpaint radius: {self.params.glare_inpaint_radius}")
-                elif key == ord('u'):
-                    self.params.glare_inpaint_radius = min(10, self.params.glare_inpaint_radius + 1)
-                    print(f"[GLARE] Inpaint radius: {self.params.glare_inpaint_radius}")
-                elif key == ord('9'):
-                    self.params.contrast_alpha = max(0.5, self.params.contrast_alpha - 0.1)
-                    print(f"[IMG] Contrast: {self.params.contrast_alpha:.1f}")
-                elif key == ord('0'):
-                    self.params.contrast_alpha = min(3.0, self.params.contrast_alpha + 0.1)
-                    print(f"[IMG] Contrast: {self.params.contrast_alpha:.1f}")
-                elif key == ord(','):
-                    self.params.brightness_beta = max(-100, self.params.brightness_beta - 10)
-                    print(f"[IMG] Brightness: {self.params.brightness_beta:+d}")
-                elif key == ord('.'):
-                    self.params.brightness_beta = min(100, self.params.brightness_beta + 10)
-                    print(f"[IMG] Brightness: {self.params.brightness_beta:+d}")
-                elif key == ord('/'):
-                    self.params.gamma_value = max(0.5, self.params.gamma_value - 0.1)
-                    print(f"[IMG] Gamma: {self.params.gamma_value:.1f}")
-                elif key == ord(';'):
-                    self.params.gamma_value = min(2.0, self.params.gamma_value + 0.1)
-                    print(f"[IMG] Gamma: {self.params.gamma_value:.1f}")
-                elif key == ord('\\'):
-                    self.params.clahe_clip_limit = max(1.0, self.params.clahe_clip_limit - 0.5)
-                    print(f"[IMG] CLAHE Clip: {self.params.clahe_clip_limit:.1f}")
-                elif key == ord("'"):
-                    self.params.clahe_clip_limit = min(8.0, self.params.clahe_clip_limit + 0.5)
-                    print(f"[IMG] CLAHE Clip: {self.params.clahe_clip_limit:.1f}")
-                elif key == ord(' '):
-                    all_on = self.views.show_original and self.views.show_grayscale
-                    self.views.show_original = not all_on
-                    self.views.show_grayscale = not all_on
-                    self.views.show_preprocessed = not all_on
-                    self.views.show_threshold = not all_on
-                    self.views.show_morphology = not all_on
-                    self.views.show_contours = not all_on
 
         except KeyboardInterrupt:
             print("\n[INFO] Interrupted by user")
@@ -1082,7 +1100,7 @@ class PupilTrackerTuner:
                 print(f"[WARN] Could not auto-save calibration: {e}")
 
             try:
-                if self.cap is not None:
+                if self.cap is not None and self._owns_camera:
                     self.cap.release()
                     print("[INFO] Camera released")
             except Exception as e:

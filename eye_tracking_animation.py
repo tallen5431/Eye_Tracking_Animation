@@ -65,10 +65,11 @@ class PupilHighlighter:
         5. Cleaned blob    - morphology-cleaned pupil blob
     """
 
-    def __init__(self, camera_id: int = 0, rotation: int = 270):
+    def __init__(self, camera_id: int = 0, rotation: int = 270, cap=None):
         self.camera_id = camera_id
         self.rotation = rotation
-        self.cap = None
+        self.cap = cap
+        self._owns_camera = cap is None
 
         # Reuse tuner's dataclasses so all parameter names match
         self.params = TuningParams()
@@ -102,8 +103,12 @@ class PupilHighlighter:
 
     def open(self) -> bool:
         """Open the camera (with warm-up and fallback scan)."""
+        if self.cap is not None and self.cap.isOpened():
+            print(f"[OK] Using shared camera {self.camera_id}")
+            return True
         try:
             self.cap, self.camera_id = open_camera(self.camera_id)
+            self._owns_camera = True
             print(f"[OK] Camera {self.camera_id} ready")
             return True
         except RuntimeError as exc:
@@ -111,9 +116,9 @@ class PupilHighlighter:
             return False
 
     def release(self):
-        if self.cap is not None:
+        if self.cap is not None and self._owns_camera:
             self.cap.release()
-            self.cap = None
+        self.cap = None
 
     # ---- ROI -----------------------------------------------------------
 
@@ -309,6 +314,89 @@ class PupilHighlighter:
         win = "Eye Tracker - Pipeline"
         cv2.imshow(win, self._canvas)
 
+    # ---- per-frame display ---------------------------------------------
+
+    def process_and_display(self, frame):
+        """Process one frame and update the display grid (no camera read)."""
+        result = self.process_frame(frame)
+        self._last_result = result
+        self._tick_fps()
+
+        overlay = result["overlay"]
+        conf = result["confidence"]
+        status = f"FPS: {self._fps:.0f}  Conf: {conf:.2f}"
+        cv2.putText(overlay, status, (10, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA)
+
+        original_vis = result["original"].copy()
+        ell = result["ellipse"]
+        if ell is not None:
+            cv2.ellipse(original_vis, ell, (0, 255, 255), 2)
+            (cx, cy), _, _ = ell
+            cv2.circle(original_vis, (int(cx), int(cy)), 3, (0, 255, 255), -1)
+
+        items = [
+            ("0. PUPIL OVERLAY", overlay),
+            ("1. Original + Ellipse", original_vis),
+            ("2. Grayscale", result["gray"]),
+            ("3. Preprocessed", result["preproc"]),
+            ("4. Threshold Mask", result["threshold"]),
+            ("5. Cleaned Blob", result["blob"]),
+        ]
+        self._show_grid(items)
+
+    def handle_key(self, key: int) -> bool:
+        """Handle keyboard input. Returns True if user wants to quit."""
+        if key == 255:
+            return False
+        if key == ord('q') or key == 27:
+            return True
+        elif key == ord('+') or key == ord('='):
+            self.params.threshold_value = min(255, self.params.threshold_value + 1)
+            print(f"  threshold = {self.params.threshold_value}")
+        elif key == ord('-') or key == ord('_'):
+            self.params.threshold_value = max(0, self.params.threshold_value - 1)
+            print(f"  threshold = {self.params.threshold_value}")
+        elif key == ord('9'):
+            self.params.contrast_alpha = max(0.5, round(self.params.contrast_alpha - 0.1, 1))
+            print(f"  contrast = {self.params.contrast_alpha:.1f}")
+        elif key == ord('0'):
+            self.params.contrast_alpha = min(3.0, round(self.params.contrast_alpha + 0.1, 1))
+            print(f"  contrast = {self.params.contrast_alpha:.1f}")
+        elif key == ord(','):
+            self.params.brightness_beta = max(-100, self.params.brightness_beta - 10)
+            print(f"  brightness = {self.params.brightness_beta:+d}")
+        elif key == ord('.'):
+            self.params.brightness_beta = min(100, self.params.brightness_beta + 10)
+            print(f"  brightness = {self.params.brightness_beta:+d}")
+        elif key == ord('['):
+            self.params.iris_expand_ratio = max(1.5, round(self.params.iris_expand_ratio - 0.1, 1))
+            print(f"  iris_expand = {self.params.iris_expand_ratio:.1f}")
+        elif key == ord(']'):
+            self.params.iris_expand_ratio = min(4.0, round(self.params.iris_expand_ratio + 0.1, 1))
+            print(f"  iris_expand = {self.params.iris_expand_ratio:.1f}")
+        elif key == ord('h'):
+            self.toggles.use_histogram_eq = not self.toggles.use_histogram_eq
+            print(f"  histogram_eq = {self.toggles.use_histogram_eq}")
+        elif key == ord('g'):
+            self.toggles.use_glint_removal = not self.toggles.use_glint_removal
+            print(f"  glint_removal = {self.toggles.use_glint_removal}")
+        elif key == ord('w'):
+            self.toggles.use_glasses_mode = not self.toggles.use_glasses_mode
+            print(f"  glasses_mode = {self.toggles.use_glasses_mode}")
+        elif key == ord('r'):
+            self.params = TuningParams()
+            self.toggles = TuningToggles()
+            self._iris_ellipse_smoothed = None
+            self._pupil_ellipse_smoothed = None
+            self._prev_pupil_center = None
+            print("  [RESET] All parameters back to defaults")
+        elif key == ord('s'):
+            result = getattr(self, '_last_result', None)
+            if result is not None:
+                self._save_snapshot(result)
+        return False
+
     # ---- main loop -----------------------------------------------------
 
     def run(self):
@@ -344,80 +432,11 @@ class PupilHighlighter:
                     time.sleep(0.05)
                     continue
 
-                result = self.process_frame(frame)
-                self._tick_fps()
+                self.process_and_display(frame)
 
-                # Add FPS + confidence text to overlay
-                overlay = result["overlay"]
-                conf = result["confidence"]
-                status = f"FPS: {self._fps:.0f}  Conf: {conf:.2f}"
-                cv2.putText(overlay, status, (10, 24),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA)
-
-                # Draw ellipse on original for comparison
-                original_vis = result["original"].copy()
-                ell = result["ellipse"]
-                if ell is not None:
-                    cv2.ellipse(original_vis, ell, (0, 255, 255), 2)
-                    (cx, cy), _, _ = ell
-                    cv2.circle(original_vis, (int(cx), int(cy)), 3, (0, 255, 255), -1)
-
-                items = [
-                    ("0. PUPIL OVERLAY", overlay),
-                    ("1. Original + Ellipse", original_vis),
-                    ("2. Grayscale", result["gray"]),
-                    ("3. Preprocessed", result["preproc"]),
-                    ("4. Threshold Mask", result["threshold"]),
-                    ("5. Cleaned Blob", result["blob"]),
-                ]
-                self._show_grid(items)
-
-                # --- keyboard controls ---
                 key = cv2.waitKey(1) & 0xFF
-                if key == ord('q') or key == 27:
+                if self.handle_key(key):
                     break
-                elif key == ord('+') or key == ord('='):
-                    self.params.threshold_value = min(255, self.params.threshold_value + 1)
-                    print(f"  threshold = {self.params.threshold_value}")
-                elif key == ord('-') or key == ord('_'):
-                    self.params.threshold_value = max(0, self.params.threshold_value - 1)
-                    print(f"  threshold = {self.params.threshold_value}")
-                elif key == ord('9'):
-                    self.params.contrast_alpha = max(0.5, round(self.params.contrast_alpha - 0.1, 1))
-                    print(f"  contrast = {self.params.contrast_alpha:.1f}")
-                elif key == ord('0'):
-                    self.params.contrast_alpha = min(3.0, round(self.params.contrast_alpha + 0.1, 1))
-                    print(f"  contrast = {self.params.contrast_alpha:.1f}")
-                elif key == ord(','):
-                    self.params.brightness_beta = max(-100, self.params.brightness_beta - 10)
-                    print(f"  brightness = {self.params.brightness_beta:+d}")
-                elif key == ord('.'):
-                    self.params.brightness_beta = min(100, self.params.brightness_beta + 10)
-                    print(f"  brightness = {self.params.brightness_beta:+d}")
-                elif key == ord('['):
-                    self.params.iris_expand_ratio = max(1.5, round(self.params.iris_expand_ratio - 0.1, 1))
-                    print(f"  iris_expand = {self.params.iris_expand_ratio:.1f}")
-                elif key == ord(']'):
-                    self.params.iris_expand_ratio = min(4.0, round(self.params.iris_expand_ratio + 0.1, 1))
-                    print(f"  iris_expand = {self.params.iris_expand_ratio:.1f}")
-                elif key == ord('h'):
-                    self.toggles.use_histogram_eq = not self.toggles.use_histogram_eq
-                    print(f"  histogram_eq = {self.toggles.use_histogram_eq}")
-                elif key == ord('g'):
-                    self.toggles.use_glint_removal = not self.toggles.use_glint_removal
-                    print(f"  glint_removal = {self.toggles.use_glint_removal}")
-                elif key == ord('w'):
-                    self.toggles.use_glasses_mode = not self.toggles.use_glasses_mode
-                    print(f"  glasses_mode = {self.toggles.use_glasses_mode}")
-                elif key == ord('r'):
-                    self.params = TuningParams()
-                    self.toggles = TuningToggles()
-                    self._iris_ellipse_smoothed = None
-                    self._pupil_ellipse_smoothed = None
-                    self._prev_pupil_center = None
-                    print("  [RESET] All parameters back to defaults")
-                elif key == ord('s'):
-                    self._save_snapshot(result)
 
         except KeyboardInterrupt:
             print("\n[INFO] Interrupted")
