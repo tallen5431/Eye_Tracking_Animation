@@ -5,7 +5,7 @@ import os
 
 @dataclass
 class TuningParams:
-    roi_size: float = 0.6
+    roi_size: float = 0.85
 
     # Pupil detection params
     threshold_value: int = 60

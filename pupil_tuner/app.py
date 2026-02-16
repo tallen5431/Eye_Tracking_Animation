@@ -4,6 +4,8 @@ import time
 import cv2
 import numpy as np
 import math
+import signal
+import sys
 
 from .config import TuningParams, TuningToggles, ViewFlags, RuntimeConfig
 from .camera import open_camera
@@ -393,6 +395,56 @@ class PupilTrackerTuner:
         self.params = TuningParams()
         self.toggles = TuningToggles()
         print("Reset parameters to defaults.")
+
+    def save_calibration(self):
+        """Save current tuning parameters and calibration for animation use."""
+        import json
+        from pathlib import Path
+
+        repo_root = Path(__file__).parent.parent
+        calibration_file = repo_root / ".eye_calibration.json"
+
+        calibration_data = {
+            "timestamp": time.time(),
+            "camera_id": self.camera_id,
+            "tuning_params": {
+                "threshold_value": self.params.threshold_value,
+                "min_area": self.params.min_area,
+                "max_area": self.params.max_area,
+                "min_circularity": self.params.min_circularity,
+                "blur_kernel_size": self.params.blur_kernel_size,
+                "contrast_alpha": self.params.contrast_alpha,
+                "brightness_beta": self.params.brightness_beta,
+                "gamma_value": self.params.gamma_value,
+                "blob_dark_percentile": self.params.blob_dark_percentile,
+                "blob_min_area": self.params.blob_min_area,
+                "blob_min_circularity": self.params.blob_min_circularity,
+                "blob_use_sat_filter": self.params.blob_use_sat_filter,
+                "blob_sat_max": self.params.blob_sat_max,
+            },
+            "current_detection": {
+                "confidence": float(self.current_confidence),
+                "has_ellipse": self.current_ellipse is not None,
+            }
+        }
+
+        if self.current_ellipse is not None:
+            (cx, cy), (w, h), angle = self.current_ellipse
+            calibration_data["current_detection"]["ellipse"] = {
+                "cx": float(cx),
+                "cy": float(cy),
+                "width": float(w),
+                "height": float(h),
+                "angle": float(angle),
+            }
+
+        try:
+            with open(calibration_file, 'w') as f:
+                json.dump(calibration_data, f, indent=2)
+            print(f"[INFO] Calibration saved to {calibration_file}")
+            print(f"[INFO]   Confidence: {self.current_confidence:.2f}")
+        except Exception as e:
+            print(f"[ERROR] Failed to save calibration: {e}")
 
     # ---------------------- detection helpers ----------------------
 
@@ -791,12 +843,28 @@ class PupilTrackerTuner:
         self.current_confidence = conf
 
     def run(self):
+        # Setup signal handlers for graceful shutdown
+        def signal_handler(signum, frame):
+            print(f"\n[INFO] Received signal {signum}, shutting down...")
+            try:
+                self.save_calibration()
+            except Exception as e:
+                print(f"[WARN] Could not save calibration on signal: {e}")
+            sys.exit(0)
+
+        signal.signal(signal.SIGINT, signal_handler)
+        signal.signal(signal.SIGTERM, signal_handler)
+
         if not self.initialize_camera():
             print("Failed to initialize camera")
             return
 
         # Run sclera-based calibration to seed the iris tracker ROI
         self._run_startup_calibration()
+
+        # Auto-save calibration every 30 seconds
+        last_autosave = time.time()
+        autosave_interval = 30.0
 
         try:
             while True:
@@ -810,6 +878,14 @@ class PupilTrackerTuner:
                 self.share_writer.maybe_write(self.current_ellipse, self.current_confidence, roi.shape[:2])
 
                 self.update_fps()
+
+                # Auto-save calibration periodically
+                if time.time() - last_autosave > autosave_interval:
+                    try:
+                        self.save_calibration()
+                        last_autosave = time.time()
+                    except Exception as e:
+                        print(f"[WARN] Auto-save failed: {e}")
 
                 # Build panel image (larger + includes mode)
                 panel = info_panel(
@@ -828,7 +904,7 @@ class PupilTrackerTuner:
                 stage4_title = "4. Edges (Canny)" if self.detect_mode == "iris" else "4. Threshold"
                 stage4_img = self.img_edges if self.detect_mode == "iris" else self.img_threshold
 
-                # NEW: overlay ellipse on preview images
+                # Overlay ellipse on preview images
                 e = self.current_ellipse
                 roi_vis = self._preview_with_ellipse(roi, e)
                 gray_vis = self._preview_with_ellipse(self.img_gray, e)
@@ -838,11 +914,10 @@ class PupilTrackerTuner:
                 stage4_vis = self._preview_with_ellipse(stage4_img, e)
                 morph_vis = self._preview_with_ellipse(self.img_morphology, e)
 
-                # Simplified grid windows
                 iris_mask_vis = self._preview_with_ellipse(
                     self.img_iris_mask, ie, color=(0, 255, 255), thickness=2
                 ) if self.img_iris_mask is not None else None
-                
+
                 items = [
                     (title0, self.img_eye_overlay),
                     ("1. Original ROI", roi_vis if self.views.show_original else None),
@@ -876,6 +951,8 @@ class PupilTrackerTuner:
                     print(f"[MODE] Now tracking: {self.detect_mode.upper()}")
                 elif key == ord('r'):
                     self.reset_defaults()
+                elif key == ord('s'):
+                    self.save_calibration()
                 elif key == ord('+') or key == ord('='):
                     self.params.threshold_value = min(255, self.params.threshold_value + 1)
                 elif key == ord('-') or key == ord('_'):
@@ -916,7 +993,6 @@ class PupilTrackerTuner:
                     self.params.morph_kernel_size = max(1, self.params.morph_kernel_size - 2)
                 elif key == ord('8'):
                     self.params.morph_kernel_size = min(31, self.params.morph_kernel_size + 2)
-                # Simplified iris controls
                 elif key == ord('i'):
                     self.params.iris_sclera_threshold = max(100, self.params.iris_sclera_threshold - 10)
                     print(f"[IRIS] Sclera threshold: {self.params.iris_sclera_threshold}")
@@ -942,26 +1018,20 @@ class PupilTrackerTuner:
                 elif key == ord('f'):
                     self.toggles.use_bilateral_filter = not self.toggles.use_bilateral_filter
                 elif key == ord('w'):
-                    # Toggle glasses mode (enhanced glare removal)
                     self.toggles.use_glasses_mode = not self.toggles.use_glasses_mode
                     print(f"[GLASSES MODE] {'ON' if self.toggles.use_glasses_mode else 'OFF'}")
                 elif key == ord('e'):
-                    # Adjust glare threshold
                     self.params.glare_threshold = max(200, self.params.glare_threshold - 10)
                     print(f"[GLARE] Threshold: {self.params.glare_threshold}")
                 elif key == ord('t'):
-                    # Adjust glare threshold
                     self.params.glare_threshold = min(250, self.params.glare_threshold + 10)
                     print(f"[GLARE] Threshold: {self.params.glare_threshold}")
                 elif key == ord('y'):
-                    # Adjust inpaint radius
                     self.params.glare_inpaint_radius = max(3, self.params.glare_inpaint_radius - 1)
                     print(f"[GLARE] Inpaint radius: {self.params.glare_inpaint_radius}")
                 elif key == ord('u'):
-                    # Adjust inpaint radius
                     self.params.glare_inpaint_radius = min(10, self.params.glare_inpaint_radius + 1)
                     print(f"[GLARE] Inpaint radius: {self.params.glare_inpaint_radius}")
-                # New granular image processing controls
                 elif key == ord('9'):
                     self.params.contrast_alpha = max(0.5, self.params.contrast_alpha - 0.1)
                     print(f"[IMG] Contrast: {self.params.contrast_alpha:.1f}")
@@ -995,9 +1065,34 @@ class PupilTrackerTuner:
                     self.views.show_morphology = not all_on
                     self.views.show_contours = not all_on
 
+        except KeyboardInterrupt:
+            print("\n[INFO] Interrupted by user")
+        except Exception as e:
+            print(f"[ERROR] Tuning tool error: {e}")
+            import traceback
+            traceback.print_exc()
         finally:
+            print("[INFO] Cleaning up...")
+
+            # Auto-save calibration on exit
+            try:
+                print("[INFO] Auto-saving calibration...")
+                self.save_calibration()
+            except Exception as e:
+                print(f"[WARN] Could not auto-save calibration: {e}")
+
             try:
                 if self.cap is not None:
                     self.cap.release()
-            finally:
+                    print("[INFO] Camera released")
+            except Exception as e:
+                print(f"[WARN] Error releasing camera: {e}")
+
+            try:
                 cv2.destroyAllWindows()
+                cv2.waitKey(1)
+                print("[INFO] Windows closed")
+            except Exception as e:
+                print(f"[WARN] Error closing windows: {e}")
+
+            print("[INFO] Tuning tool stopped")
