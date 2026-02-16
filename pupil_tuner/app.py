@@ -4,8 +4,9 @@ import time
 import cv2
 import numpy as np
 import math
+from collections import deque
 
-from .config import TuningParams, TuningToggles, ViewFlags, RuntimeConfig
+from .config import TuningParams, TuningToggles, ViewFlags, RuntimeConfig, save_config, load_config, PerformanceProfile
 from .camera import open_camera
 from .pipeline import (
     to_gray,
@@ -32,6 +33,87 @@ from calibration import (
     load_calibration,
     save_calibration,
 )
+
+
+# ============================================================================
+# Performance Optimization Classes
+# ============================================================================
+
+class AdaptiveFrameSkipper:
+    """Skip frames intelligently when processing falls behind"""
+    
+    def __init__(self, target_fps: float = 30.0):
+        self.target_fps = target_fps
+        self.skip_counter = 0
+        self.consecutive_slow = 0
+    
+    def should_skip_frame(self, current_fps: float) -> bool:
+        """Returns True if frame should be skipped to catch up"""
+        if current_fps < self.target_fps * 0.5:
+            # Very slow - aggressive skipping
+            self.consecutive_slow += 1
+            self.skip_counter += 1
+            return (self.skip_counter % 3) != 0  # Process 1 in 3
+        
+        elif current_fps < self.target_fps * 0.7:
+            # Moderately slow - skip every other
+            self.consecutive_slow += 1
+            self.skip_counter += 1
+            return (self.skip_counter % 2) != 0  # Process 1 in 2
+        
+        else:
+            # Fast enough - process all
+            self.consecutive_slow = 0
+            self.skip_counter = 0
+            return False
+
+
+class DetectionValidator:
+    """Validate detections to prevent outliers and jumps"""
+    
+    def __init__(self, history_size: int = 5, max_jump_px: float = 50.0):
+        self.history = deque(maxlen=history_size)
+        self.max_jump_px = max_jump_px
+        self.rejection_count = 0
+    
+    def validate(self, new_ellipse, confidence: float):
+        """
+        Validate new detection against history
+        Returns: (validated_ellipse, is_valid)
+        """
+        if new_ellipse is None:
+            return None, False
+        
+        # First detection - accept
+        if len(self.history) == 0:
+            self.history.append(new_ellipse)
+            return new_ellipse, True
+        
+        # Check jump distance
+        (new_cx, new_cy), (new_w, new_h), new_angle = new_ellipse
+        (old_cx, old_cy), (old_w, old_h), old_angle = self.history[-1]
+        
+        # Position jump
+        pos_jump = np.sqrt((new_cx - old_cx)**2 + (new_cy - old_cy)**2)
+        
+        # Size jump (relative)
+        size_jump = abs(new_w - old_w) / max(old_w, 1.0)
+        
+        # Adaptive threshold based on confidence
+        jump_threshold = self.max_jump_px * (2.0 - confidence)  # Lower conf = stricter
+        
+        if pos_jump > jump_threshold:
+            # Suspicious jump - reject
+            self.rejection_count += 1
+            return self.history[-1], False  # Return previous
+        
+        if size_jump > 0.5:  # 50% size change is suspicious
+            self.rejection_count += 1
+            return self.history[-1], False
+        
+        # Valid detection
+        self.history.append(new_ellipse)
+        return new_ellipse, True
 
 
 class PupilTrackerTuner:
@@ -115,6 +197,10 @@ class PupilTrackerTuner:
         self._DETECTION_HOLD_MAX = 8  # hold last good detection for up to 8 frames
         self._held_ellipse = None
         self._held_confidence = 0.0
+        
+        # Performance optimizations
+        self.frame_skipper = AdaptiveFrameSkipper(target_fps=30.0)
+        self.validator = DetectionValidator(history_size=5, max_jump_px=50.0)
 
     # ---------------------- window layout helpers ----------------------
 
@@ -776,6 +862,11 @@ class PupilTrackerTuner:
         # Compute iris ellipse AFTER we have pupil ellipse
         self.iris_ellipse = self._fit_iris_ellipse_simple(self.img_preprocessed, ellipse)
 
+        # Validate detection to prevent jumps
+        ellipse, is_valid = self.validator.validate(ellipse, best_score)
+        if not is_valid and self.validator.rejection_count % 10 == 0:
+            print(f"[VALIDATOR] Rejected jump (total: {self.validator.rejection_count})")
+
         self.current_ellipse = ellipse
         self.current_confidence = float(best_score)
         self.detected_contours = metas
@@ -803,6 +894,10 @@ class PupilTrackerTuner:
                 ret, frame = self.cap.read()
                 if not ret:
                     break
+
+                # Adaptive frame skipping to maintain performance
+                if self.frame_skipper.should_skip_frame(self.fps):
+                    continue
 
                 roi, _ = self.get_roi(frame)
 
@@ -871,6 +966,30 @@ class PupilTrackerTuner:
 
                 if key == ord('q') or key == 27:
                     break
+                
+                # Config save/load
+                elif key == ord('s'):
+                    save_config(self.params, self.toggles, self.runtime)
+                elif key == ord('l'):
+                    loaded = load_config()
+                    if loaded[0] is not None:
+                        self.params, self.toggles, self.runtime = loaded
+                
+                # Performance profiles
+                elif key == ord('!'):  # Shift+1
+                    self.params, self.toggles = PerformanceProfile.high_speed()
+                    print("[PROFILE] High Speed (30+ FPS)")
+                elif key == ord('@'):  # Shift+2
+                    self.params, self.toggles = PerformanceProfile.balanced()
+                    print("[PROFILE] Balanced (default)")
+                elif key == ord('#'):  # Shift+3
+                    self.params, self.toggles = PerformanceProfile.high_quality()
+                    print("[PROFILE] High Quality (best detection)")
+                elif key == ord('$'):  # Shift+4
+                    self.params, self.toggles = PerformanceProfile.glasses_mode()
+                    print("[PROFILE] Glasses Mode (glare handling)")
+                
+                # Mode switching
                 elif key == ord('m'):
                     self.detect_mode = "iris" if self.detect_mode == "pupil" else "pupil"
                     print(f"[MODE] Now tracking: {self.detect_mode.upper()}")

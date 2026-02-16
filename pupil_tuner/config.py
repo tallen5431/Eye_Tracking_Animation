@@ -2,10 +2,11 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import os
+import json
 
 @dataclass
 class TuningParams:
-    roi_size: float = 0.6
+    roi_size: float = 0.8
 
     # Pupil detection params
     threshold_value: int = 60
@@ -109,3 +110,130 @@ def to_dict(params: TuningParams, toggles: TuningToggles, runtime: RuntimeConfig
         "share_hz": runtime.share_hz,
     })
     return d
+
+
+# ============================================================================
+# Config Save/Load - Eliminates re-tuning every session
+# ============================================================================
+
+def save_config(params: TuningParams, toggles: TuningToggles, runtime: RuntimeConfig, 
+                path: Path = Path("config/last_tuning.json")):
+    """Save current tuning configuration"""
+    path.parent.mkdir(exist_ok=True)
+    config = {
+        'params': asdict(params),
+        'toggles': asdict(toggles),
+        'runtime': {
+            'camera_id': runtime.camera_id,
+            'camera_rotation': runtime.camera_rotation,
+            'share_hz': runtime.share_hz,
+        },
+        'version': '1.0',
+    }
+    with open(path, 'w') as f:
+        json.dump(config, f, indent=2)
+    print(f"✓ Configuration saved to {path}")
+
+def load_config(path: Path = Path("config/last_tuning.json")):
+    """Load tuning configuration"""
+    if not path.exists():
+        print(f"⚠ No config found at {path}, using defaults")
+        return None, None, None
+    
+    try:
+        with open(path, 'r') as f:
+            config = json.load(f)
+        
+        params = TuningParams(**config.get('params', {}))
+        toggles = TuningToggles(**config.get('toggles', {}))
+        
+        runtime_data = config.get('runtime', {})
+        runtime = RuntimeConfig(
+            camera_id=runtime_data.get('camera_id', 0),
+            camera_rotation=runtime_data.get('camera_rotation', 270),
+            share_hz=runtime_data.get('share_hz', 30.0),
+        )
+        
+        print(f"✓ Configuration loaded from {path}")
+        return params, toggles, runtime
+    except Exception as e:
+        print(f"✗ Failed to load config: {e}")
+        return None, None, None
+
+
+# ============================================================================
+# Performance Profiles - One-key optimization
+# ============================================================================
+
+class PerformanceProfile:
+    """Pre-configured parameter sets for different scenarios"""
+    
+    @staticmethod
+    def high_speed():
+        """
+        Fastest (30+ FPS) - For gaming, real-time interaction
+        Lower quality but very responsive
+        """
+        params = TuningParams()
+        params.blur_kernel_size = 3
+        params.blob_close_ksize = 15
+        params.clahe_clip_limit = 2.0
+        params.blob_keep_top_k = 3
+        params.blob_min_circularity = 0.30
+        params.iris_smooth_alpha = 0.60
+        
+        toggles = TuningToggles()
+        toggles.use_histogram_eq = False
+        toggles.use_bilateral_filter = False
+        toggles.use_glint_removal = False
+        
+        return params, toggles
+    
+    @staticmethod
+    def balanced():
+        """
+        Balanced (25-30 FPS) - DEFAULT
+        Good quality and performance
+        """
+        return TuningParams(), TuningToggles()
+    
+    @staticmethod
+    def high_quality():
+        """
+        Best quality (15-20 FPS) - For recording, analysis
+        Slower but most accurate
+        """
+        params = TuningParams()
+        params.blur_kernel_size = 7
+        params.blob_close_ksize = 29
+        params.clahe_clip_limit = 3.5
+        params.blob_keep_top_k = 8
+        params.blob_min_circularity = 0.45
+        params.iris_smooth_alpha = 0.85
+        
+        toggles = TuningToggles()
+        toggles.use_histogram_eq = True
+        toggles.use_bilateral_filter = True
+        toggles.use_glint_removal = True
+        
+        return params, toggles
+    
+    @staticmethod
+    def glasses_mode():
+        """
+        Optimized for glasses - Handles reflections and glare
+        """
+        params = TuningParams()
+        params.glare_threshold = 210
+        params.glare_inpaint_radius = 7
+        params.blob_sat_max = 120
+        params.blob_close_ksize = 31
+        params.iris_glint_threshold = 235
+        params.iris_mask_close_k = 21
+        
+        toggles = TuningToggles()
+        toggles.use_histogram_eq = True
+        toggles.use_glint_removal = True
+        toggles.use_glasses_mode = True
+        
+        return params, toggles

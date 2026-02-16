@@ -47,3 +47,11 @@ def _apply_props(cap, width: int, height: int, fps: int):
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     cap.set(cv2.CAP_PROP_FPS, fps)
+    
+    # Optimization: Minimize buffer lag for real-time tracking
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    
+    # Optimize exposure for eye tracking (reduces motion blur)
+    cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)  # Manual mode
+    cap.set(cv2.CAP_PROP_EXPOSURE, -6)  # Fast shutter
+    cap.set(cv2.CAP_PROP_AUTO_WB, 0)  # Disable auto white balance for consistency

@@ -1,0 +1,74 @@
+{
+  "timestamp": 1771256464.037007,
+  "image_w": 288,
+  "image_h": 384,
+  "bbox_pad_frac": 0.18,
+  "ellipse_fit": [
+    [
+      153.40805053710938,
+      142.6983642578125
+    ],
+    [
+      252.19027709960938,
+      276.3403625488281
+    ],
+    132.8706817626953
+  ],
+  "ellipse_roi": [
+    [
+      153.40805053710938,
+      142.6983642578125
+    ],
+    [
+      307.6721380615234,
+      337.1352423095703
+    ],
+    132.8706817626953
+  ],
+  "config": {
+    "camera_id": 0,
+    "warmup_frames": 10,
+    "capture_frames": 40,
+    "capture_stride": 1,
+    "max_capture_seconds": 3.0,
+    "resize_w": null,
+    "flip": null,
+    "sclera_hsv_sample": [
+      111,
+      33,
+      100
+    ],
+    "s_margin": 25,
+    "v_margin_low": 12,
+    "v_margin_high": 55,
+    "v_step": 5,
+    "close_k": 7,
+    "close_iters": 2,
+    "per_image_mode": "vote",
+    "per_image_min_frac": 0.22,
+    "final_min_image_frac": 0.25,
+    "final_close_k": 11,
+    "final_close_iters": 2,
+    "use_center_weight": true,
+    "center_sigma_frac": 0.28,
+    "center_power": 2.0,
+    "weighted_min_frac": 0.23,
+    "eye_min_frac": 0.2,
+    "row_half_width_frac": 0.34,
+    "row_min_support_frac": 0.12,
+    "y_top_frac": 0.1,
+    "y_bot_frac": 0.72,
+    "row_peak_min_frac": 0.28,
+    "global_peak_x_tol_frac": 0.22,
+    "eye_dilate_k": 13,
+    "eye_close_k": 21,
+    "eye_close_iters": 2,
+    "keep_largest_centered": true,
+    "center_dist_frac": 0.28,
+    "ellipse_expand_k": 19,
+    "ellipse_expand_iters": 1,
+    "ellipse_min_area": 1200,
+    "ellipse_size_mult": 1.22,
+    "save_path": "logs/calibration_roi.json"
+  }
+}

@@ -210,8 +210,8 @@ def info_panel(
         return y + line_h
 
     # ------- Header -------
-    header = f"MODE: {detect_mode.upper()}  (m to toggle)     SPACE: toggle views     r: reset     q/ESC: quit"
-    cv2.putText(panel, header, (col1_x, y_top), font, 0.50, cyan, 1, cv2.LINE_AA)
+    header = f"MODE: {detect_mode.upper()}  (m)  |  SAVE: s  LOAD: l  |  PROFILES: Shift+1/2/3/4  |  SPACE: views  |  r: reset  |  q: quit"
+    cv2.putText(panel, header, (col1_x, y_top), font, 0.45, cyan, 1, cv2.LINE_AA)
     y_start = y_top + line_h + section_gap
 
     # ============ COLUMN 1: Detection ============
